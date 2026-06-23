@@ -1,0 +1,33 @@
+# ── Streaming preset ─────────────────────────────────────────────────────────
+# ultra_low : att_context=[56,0]  · chunk= 80ms ·  4 packets/chunk
+# low       : att_context=[56,1]  · chunk=160ms ·  8 packets/chunk
+# medium    : att_context=[56,3]  · chunk=320ms · 16 packets/chunk
+# balanced  : att_context=[56,6]  · chunk=560ms · 28 packets/chunk  ← default
+# high      : att_context=[56,13] · chunk=1120ms· 56 packets/chunk
+#
+# Override via env:  ASR_STREAMING_PRESET=high
+# Override locally:  create config/settings.local.yaml (gitignored)
+streaming_preset: high
+
+# ── Batch inference ───────────────────────────────────────────────────────────
+# per_session: immediate inference per session (simple, lowest added latency)
+# dynamic    : collect up to max_batch_size sessions within batch_timeout_ms,
+#              then dispatch as one GPU call. Switch when sessions > 100 and
+#              GPU utilisation is below 50%.
+batch_mode: per_session
+max_batch_size: 8
+batch_timeout_ms: 20
+
+# ── Server ────────────────────────────────────────────────────────────────────
+host: "0.0.0.0"
+port: 8000
+max_sessions: 50
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model_name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
+device: "cuda"
+default_lang: "auto"
+
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+end_of_speech_timeout_s: 3.0
+thread_pool_workers: 4
