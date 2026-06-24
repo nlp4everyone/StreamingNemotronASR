@@ -1,4 +1,5 @@
 import logging
+import time
 import threading
 import numpy as np
 import torch
@@ -27,14 +28,24 @@ class NemoStreamingEngine:
     def load(self) -> None:
         """Download (or cache) model weights and load directly onto the configured device."""
         import nemo.collections.asr as nemo_asr
+        from nemo.utils import logging as nemo_logging
 
+        # Silence NeMo's verbose load-time messages (tokenizer init, training-config warnings).
+        # Must be called after the NeMo import (which initialises the Singleton at INFO level)
+        # but before from_pretrained(), which emits the warning during __init__.
+        nemo_logging.set_verbosity(nemo_logging.ERROR)
+
+        t0 = time.perf_counter()
         logger.info("loading %s on %s ...", settings.model_name, self._device)
 
         # 1. load weights
+        t1 = time.perf_counter()
         self._model = nemo_asr.models.ASRModel.from_pretrained(
             model_name=settings.model_name,
             map_location=self._device,
         )
+        logger.info("weights loaded in %.1fs", time.perf_counter() - t1)
+
         # 2. eval mode — disables dropout / batch-norm updates
         self._model.eval()
 
@@ -54,8 +65,10 @@ class NemoStreamingEngine:
         # 5. set default language prompt — required; model returns empty strings without it
         if hasattr(self._model, "set_inference_prompt"):
             self._model.set_inference_prompt(settings.default_lang)
+
         logger.info(
-            "model ready — preset=%s att_context=%s lang=%s",
+            "model ready in %.1fs — preset=%s att_context=%s lang=%s",
+            time.perf_counter() - t0,
             settings.preset.name,
             settings.preset.att_context_size,
             settings.default_lang,
