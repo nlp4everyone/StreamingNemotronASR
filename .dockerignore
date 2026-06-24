@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+config/settings.local.yaml
+*.pt
+*.nemo
+.cache/
+logs/
+.git/
+.idea/
+*.md
+scripts/

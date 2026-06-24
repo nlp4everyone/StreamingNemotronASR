@@ -1,0 +1,12 @@
+__pycache__/
+.claude
+.idea
+*.py[cod]
+.venv/
+venv/
+.env
+config/settings.local.yaml
+*.pt
+*.nemo
+.cache/
+logs/
