@@ -33,6 +33,13 @@ class SessionManager:
             self._release_cache(session)
             logger.info("session removed: %s (total: %d)", session_id, len(self._sessions))
 
+    def evict(self, session_id: UUID) -> None:
+        """Cancel the session's EOS timer and remove it — used by the idle sweeper."""
+        session = self._sessions.get(session_id)
+        if session and session.eos_task and not session.eos_task.done():
+            session.eos_task.cancel()
+        self.remove(session_id)
+
     def count(self) -> int:
         """Number of currently active sessions."""
         return len(self._sessions)

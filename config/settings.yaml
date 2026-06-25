@@ -39,6 +39,10 @@ end_of_speech_timeout_s: 3.0
 # Non-final chunks are dropped when a session already has this many requests
 # in-flight. 1=strictest (sequential), 2=one batch_timeout of buffer.
 max_pending_per_session: 2
+# Idle session cleanup (ghost sessions — TCP alive but no audio).
+# Dead TCP connections are handled by uvicorn ws-ping-interval=20 ws-ping-timeout=30.
+idle_timeout_s: 60.0
+session_sweep_interval_s: 30.0
 # With pool_size=1 only one _batch_infer runs at a time; 2 workers allows the
 # second thread to preprocess (CPU) while the first holds the pool lock.
 thread_pool_workers: 2

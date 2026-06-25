@@ -75,6 +75,11 @@ class Settings(BaseSettings):
 
     # ── Behaviour ──────────────────────────────────────────────
     end_of_speech_timeout_s: float = 3.0
+    # Idle session cleanup: evict sessions silent longer than idle_timeout_s.
+    # Complements uvicorn ws-ping-interval (dead TCP) — this handles ghost sessions
+    # where the TCP connection is alive but the client stopped sending audio.
+    idle_timeout_s: float = 60.0
+    session_sweep_interval_s: float = 30.0
     # Max inference requests in-flight per session. Non-final chunks beyond this
     # are dropped silently — keeps the queue bounded and sessions current.
     # 1 = strictest (no queuing), 2 = one batch_timeout worth of buffer.
