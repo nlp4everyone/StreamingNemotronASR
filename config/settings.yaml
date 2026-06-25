@@ -27,7 +27,15 @@ max_sessions: 200
 model_name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
 device: "cuda"
 default_lang: "auto"
+# Number of independent model instances in the pool.
+# pool_size=1: safe on all GPUs, serializes all CUDA ops (no concurrent kernel conflict).
+# pool_size=2: doubles GPU throughput but requires per-instance CUDA stream isolation
+#              to avoid illegal memory access from concurrent CUDA kernels. Set only
+#              after confirming GPU has >= 3 GB free VRAM beyond session caches.
+model_pool_size: 1
 
 # ── Behaviour ─────────────────────────────────────────────────────────────────
 end_of_speech_timeout_s: 3.0
-thread_pool_workers: 8
+# With pool_size=1 only one _batch_infer runs at a time; 2 workers allows the
+# second thread to preprocess (CPU) while the first holds the pool lock.
+thread_pool_workers: 2

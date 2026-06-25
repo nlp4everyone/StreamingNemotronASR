@@ -1,131 +1,128 @@
 import logging
+import queue
 import time
-import threading
+from collections import defaultdict
+
 import numpy as np
 import torch
 import torchaudio
+
 from config import settings
 
 logger = logging.getLogger(__name__)
 
+
 class NemoStreamingEngine:
     """
     Wraps nvidia/nemotron-3.5-asr-streaming-0.6b via NeMo.
-    Singleton — loaded once at startup, weights are read-only.
-    All mutable state lives in ASRCacheState (per-session).
 
-    Called from ThreadPoolExecutor threads — blocking CUDA calls are expected here.
+    Maintains a pool of model_pool_size independent model instances.
+    Each inference call acquires one instance exclusively — set_inference_prompt
+    and conformer_stream_step execute on the same object with no concurrent
+    access, eliminating the lang-prompt race condition for multi-language use.
     """
 
     def __init__(self) -> None:
-        """Model is lazy-loaded; call load() before any inference."""
-        self._model = None
+        self._pool: queue.Queue = queue.Queue()
         self._device = settings.device
-        self._prompt_lock = threading.Lock()  # set_inference_prompt writes shared model state
+        self._loaded = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def load(self) -> None:
-        """Download (or cache) model weights and load directly onto the configured device."""
-        import nemo.collections.asr as nemo_asr
-        from nemo.utils import logging as nemo_logging
-
-        # Silence NeMo's verbose load-time messages (tokenizer init, training-config warnings).
-        # Must be called after the NeMo import (which initialises the Singleton at INFO level)
-        # but before from_pretrained(), which emits the warning during __init__.
-        nemo_logging.set_verbosity(nemo_logging.ERROR)
-
-        t0 = time.perf_counter()
-        logger.info("loading %s on %s ...", settings.model_name, self._device)
-
-        # 1. load weights
-        t1 = time.perf_counter()
-        self._model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name=settings.model_name,
-            map_location=self._device,
-        )
-        logger.info("weights loaded in %.1fs", time.perf_counter() - t1)
-
-        # 2. eval mode — disables dropout / batch-norm updates
-        self._model.eval()
-
-        # 3. apply attention context size from preset (controls look-ahead frames)
-        self._model.encoder.set_default_att_context_size(
-            list(settings.preset.att_context_size)
-        )
-
-        # 4. apply decoding strategy / max symbols per step
-        if settings.decoding_strategy != "greedy_batch":
-            self._model.change_decoding_strategy(
-                decoding_cfg={"strategy": settings.decoding_strategy}
-            )
-        if settings.max_symbols_per_step != 10:
-            self._model.decoding.cfg.greedy.max_symbols = settings.max_symbols_per_step
-
-        # 5. set default language prompt — required; model returns empty strings without it
-        if hasattr(self._model, "set_inference_prompt"):
-            self._model.set_inference_prompt(settings.default_lang)
-
+        """Load model_pool_size instances onto the configured device."""
+        n = settings.model_pool_size
         logger.info(
-            "model ready in %.1fs — preset=%s att_context=%s lang=%s",
+            "loading %d instance(s) of %s on %s ...", n, settings.model_name, self._device
+        )
+        t0 = time.perf_counter()
+        for i in range(n):
+            self._pool.put(self._load_one(i, n))
+        self._loaded = True
+        logger.info(
+            "model pool ready (%d instances) in %.1fs — preset=%s att_context=%s lang=%s",
+            n,
             time.perf_counter() - t0,
             settings.preset.name,
             settings.preset.att_context_size,
             settings.default_lang,
         )
 
-    def is_ready(self) -> bool:
-        """Check whether the model has been loaded.
+    def _load_one(self, idx: int, total: int):
+        import nemo.collections.asr as nemo_asr
+        from nemo.utils import logging as nemo_logging
 
-        Returns:
-            True once load() has completed successfully.
-        """
-        return self._model is not None
+        nemo_logging.set_verbosity(nemo_logging.ERROR)
+
+        t1 = time.perf_counter()
+        logger.info("loading instance %d/%d ...", idx + 1, total)
+
+        model = nemo_asr.models.ASRModel.from_pretrained(
+            model_name=settings.model_name,
+            map_location=self._device,
+        )
+        model.eval()
+        model.encoder.set_default_att_context_size(list(settings.preset.att_context_size))
+
+        if settings.decoding_strategy != "greedy_batch":
+            model.change_decoding_strategy(
+                decoding_cfg={"strategy": settings.decoding_strategy}
+            )
+        if settings.max_symbols_per_step != 10:
+            model.decoding.cfg.greedy.max_symbols = settings.max_symbols_per_step
+
+        if hasattr(model, "set_inference_prompt"):
+            model.set_inference_prompt(settings.default_lang)
+
+        logger.info("instance %d/%d ready in %.1fs", idx + 1, total, time.perf_counter() - t1)
+        return model
+
+    def is_ready(self) -> bool:
+        return self._loaded
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
 
-    def _preprocess(self,
-                    pcm_bytes: bytes,
-                    sample_rate: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _preprocess(
+        self, pcm_bytes: bytes, sample_rate: int, model
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert raw PCM audio to log-mel spectrogram features.
 
         Args:
             pcm_bytes: Raw audio samples encoded as int16.
             sample_rate: Sample rate of the input audio in Hz.
+            model: The model instance whose preprocessor to use.
 
         Returns:
-            Tuple of (mel, mel_len) where mel has shape [1, D, T]
-            and mel_len has shape [1].
+            Tuple of (mel, mel_len) where mel has shape [1, D, T] and mel_len has shape [1].
         """
-        # 1. decode int16 → float32 in [-1, 1]
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
-        # 2. resample to 16 kHz if needed
         if sample_rate != 16000:
             waveform = torch.from_numpy(audio).unsqueeze(0)
             waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
             audio = waveform.squeeze(0).numpy()
 
-        # 3. move to device and build length tensor
         audio_t = torch.from_numpy(audio).unsqueeze(0).to(self._device)
         audio_len = torch.tensor([len(audio)], dtype=torch.long, device=self._device)
 
-        # 4. extract log-mel features via model's own preprocessor
         with torch.inference_mode():
-            mel, mel_len = self._model.preprocessor(
-                input_signal=audio_t,
-                length=audio_len,
-            )
-        return mel, mel_len  # [1, D, T], [1]
+            mel, mel_len = model.preprocessor(input_signal=audio_t, length=audio_len)
+        return mel, mel_len
 
     # ── Single-session inference ───────────────────────────────────────────────
 
-    def stream_step(self,
-                    pcm_bytes: bytes,
-                    sample_rate: int,
-                    cache: "ASRCacheState",
-                    lang: str = "auto") -> tuple[str, "ASRCacheState"]:  # noqa: F821
+    def stream_step(
+        self,
+        pcm_bytes: bytes,
+        sample_rate: int,
+        cache: "ASRCacheState",  # noqa: F821
+        lang: str = "auto",
+    ) -> tuple[str, "ASRCacheState"]:  # noqa: F821
         """Run one streaming inference step for a single session.
+
+        Acquires an exclusive model instance from the pool — set_inference_prompt
+        and conformer_stream_step are guaranteed to run on the same object with no
+        concurrent writes from other threads.
 
         Args:
             pcm_bytes: Raw audio chunk encoded as int16 PCM.
@@ -138,84 +135,220 @@ class NemoStreamingEngine:
         """
         from app.session.state import ASRCacheState
 
-        # 1. convert raw audio to log-mel features
-        mel, mel_len = self._preprocess(pcm_bytes, sample_rate)
+        model = self._pool.get()
+        try:
+            mel, mel_len = self._preprocess(pcm_bytes, sample_rate, model)
 
-        # 2. set language prompt (locked — shared model state)
-        if hasattr(self._model, "set_inference_prompt"):
-            with self._prompt_lock:
-                self._model.set_inference_prompt(lang)
+            if hasattr(model, "set_inference_prompt"):
+                model.set_inference_prompt(lang)
 
-        # 3. run conformer streaming inference
-        with torch.inference_mode():
-            # NeMo return order (mixins.py):
-            #   [0] greedy_predictions          — list[Tensor], token-id sequences
-            #   [1] all_hyp_or_transcribed_texts — list[str] (CTC) or list[Hypothesis] (RNNT)
-            #   [2] cache_last_channel_next     — attention cache Tensor
-            #   [3] cache_last_time_next        — convolution cache Tensor
-            #   [4] cache_last_channel_next_len — length Tensor  shape (batch,)
-            #   [5] best_hyp                    — list[Hypothesis] (RNNT) or None (CTC)
-            (
-                greedy_predictions,
-                all_hyp_or_transcribed_texts,
-                new_att_cache,
-                new_conv_cache,
-                new_att_cache_len,
-                best_hyp,
-            ) = self._model.conformer_stream_step(
-                processed_signal=mel,
-                processed_signal_length=mel_len,
-                cache_last_channel=cache.att_cache,
-                cache_last_time=cache.conv_cache,
-                cache_last_channel_len=cache.att_cache_len,
-                keep_all_outputs=False,
-                previous_hypotheses=cache.hypotheses,
-                previous_pred_out=cache.pred_out,
-                drop_extra_pre_encoded=None,
-                return_transcription=True,
-            )
+            with torch.inference_mode():
+                (
+                    greedy_predictions,
+                    all_hyp_or_transcribed_texts,
+                    new_att_cache,
+                    new_conv_cache,
+                    new_att_cache_len,
+                    best_hyp,
+                ) = model.conformer_stream_step(
+                    processed_signal=mel,
+                    processed_signal_length=mel_len,
+                    cache_last_channel=cache.att_cache,
+                    cache_last_time=cache.conv_cache,
+                    cache_last_channel_len=cache.att_cache_len,
+                    keep_all_outputs=False,
+                    previous_hypotheses=cache.hypotheses,
+                    previous_pred_out=cache.pred_out,
+                    drop_extra_pre_encoded=None,
+                    return_transcription=True,
+                )
+        finally:
+            self._pool.put(model)
 
-        # 4. extract text — RNNT yields Hypothesis objects, CTC yields plain strings
         first = all_hyp_or_transcribed_texts[0] if all_hyp_or_transcribed_texts else None
-        if first is None:
-            text = ""
-        elif isinstance(first, str):
-            text = first
-        else:
-            text = getattr(first, "text", "") or ""
+        text = _extract_text(first)
+        logger.debug("inference: type=%s text=%r", type(first).__name__, text)
 
-        logger.info("DEBUG inference: type=%s text=%r hyp_text=%r y_seq_len=%s",
-                    type(first).__name__, text,
-                    getattr(first, "text", "N/A"),
-                    len(getattr(first, "y_sequence", [])) if first is not None else 0)
-
-        # 5. pack updated cache for next step
-        new_cache = ASRCacheState(
+        return text, ASRCacheState(
             att_cache=new_att_cache,
             conv_cache=new_conv_cache,
             att_cache_len=new_att_cache_len,
-            hypotheses=best_hyp,          # passed back as previous_hypotheses (RNNT)
-            pred_out=greedy_predictions,  # passed back as previous_pred_out (CTC)
+            hypotheses=best_hyp,
+            pred_out=greedy_predictions,
         )
-        return text, new_cache
 
     # ── Batch inference ────────────────────────────────────────────────────────
 
-    def stream_step_batch(self,
-                          requests: list[tuple[bytes, int, "ASRCacheState", str]]) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
-        """Run inference for multiple sessions in one call.
+    def stream_step_batch(
+        self,
+        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
+    ) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
+        """Run inference for multiple sessions in one GPU call.
+
+        Groups requests by (lang, has_decoder_state) so each sub-batch has
+        homogeneous cache shapes. Each group acquires an exclusive model instance
+        from the pool — no lang-prompt race condition.
 
         Args:
-            requests: List of (pcm_bytes, sample_rate, cache, lang) tuples,
-                one per session.
+            requests: List of (pcm_bytes, sample_rate, cache, lang) tuples.
 
         Returns:
             List of (transcript_text, updated_cache) in the same order as requests.
-
-        Note:
-            Currently runs sessions sequentially. TODO: stack [B, D, T] tensors
-            for true GPU batching with conformer_stream_step(B > 1).
         """
-        return [self.stream_step(pcm, sr, cache, lang) for pcm, sr, cache, lang in requests]
+        if len(requests) == 1:
+            pcm, sr, cache, lang = requests[0]
+            return [self.stream_step(pcm, sr, cache, lang)]
+
+        groups: dict[tuple, list[tuple[int, tuple]]] = defaultdict(list)
+        for i, req in enumerate(requests):
+            _, _, cache, lang = req
+            has_dec = cache.hypotheses is not None or cache.pred_out is not None
+            groups[(lang, has_dec)].append((i, req))
+
+        results: list = [None] * len(requests)
+        for group in groups.values():
+            indices = [i for i, _ in group]
+            group_reqs = [req for _, req in group]
+            for idx, res in zip(indices, self._batch_infer(group_reqs)):
+                results[idx] = res
+
+        return results
+
+    def _batch_infer(
+        self,
+        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
+    ) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
+        """True GPU batch inference for a homogeneous group of requests.
+
+        Acquires an exclusive model instance — set_inference_prompt and
+        conformer_stream_step execute on the same object, safe from concurrent writes.
+
+        Args:
+            requests: Homogeneous list of (pcm_bytes, sample_rate, cache, lang).
+
+        Returns:
+            List of (transcript_text, updated_cache) in the same order.
+        """
+        from app.session.state import ASRCacheState
+
+        B = len(requests)
+        model = self._pool.get()
+        try:
+            # 1. preprocess per session
+            mels_lens = [self._preprocess(pcm, sr, model) for pcm, sr, _, _ in requests]
+            mels = [ml[0] for ml in mels_lens]
+            mel_lens = [ml[1] for ml in mels_lens]
+
+            # 2. pad to T_max and stack → [B, D, T_max]
+            D = mels[0].shape[1]
+            T_max = max(m.shape[2] for m in mels)
+            mel_batch = mels[0].new_zeros(B, D, T_max)
+            for i, m in enumerate(mels):
+                mel_batch[i, :, : m.shape[2]] = m[0]
+            mel_len_batch = torch.cat(mel_lens, dim=0)
+
+            # 3. stack encoder caches along batch dim
+            caches = [r[2] for r in requests]
+            att_batch, conv_batch, att_len_batch = self._stack_encoder_caches(caches)
+
+            # 4. decoder state
+            all_hyps = [c.hypotheses for c in caches]
+            previous_hypotheses = (
+                None if all(h is None for h in all_hyps) else [h[0] for h in all_hyps]
+            )
+            all_preds = [c.pred_out for c in caches]
+            previous_pred_out = (
+                None if all(p is None for p in all_preds) else [p[0] for p in all_preds]
+            )
+
+            # 5. set language — safe: this instance is not shared with any other thread
+            lang = requests[0][3]
+            if hasattr(model, "set_inference_prompt"):
+                model.set_inference_prompt(lang)
+
+            # 6. single GPU forward pass for the whole batch
+            with torch.inference_mode():
+                (
+                    greedy_predictions,
+                    all_hyp_or_texts,
+                    new_att_batch,
+                    new_conv_batch,
+                    new_att_len_batch,
+                    best_hyp_batch,
+                ) = model.conformer_stream_step(
+                    processed_signal=mel_batch,
+                    processed_signal_length=mel_len_batch,
+                    cache_last_channel=att_batch,
+                    cache_last_time=conv_batch,
+                    cache_last_channel_len=att_len_batch,
+                    keep_all_outputs=False,
+                    previous_hypotheses=previous_hypotheses,
+                    previous_pred_out=previous_pred_out,
+                    drop_extra_pre_encoded=None,
+                    return_transcription=True,
+                )
+        finally:
+            self._pool.put(model)
+
+        logger.debug("batch inference B=%d lang=%s", B, lang)
+
+        results = []
+        for i in range(B):
+            item = all_hyp_or_texts[i] if all_hyp_or_texts else None
+            results.append((
+                _extract_text(item),
+                ASRCacheState(
+                    att_cache=new_att_batch[:, i : i + 1, ...] if new_att_batch is not None else None,
+                    conv_cache=new_conv_batch[:, i : i + 1, ...] if new_conv_batch is not None else None,
+                    att_cache_len=new_att_len_batch[:, i : i + 1] if new_att_len_batch is not None else None,
+                    hypotheses=[best_hyp_batch[i]] if best_hyp_batch is not None else None,
+                    pred_out=[greedy_predictions[i]],
+                ),
+            ))
+        return results
+
+    def _stack_encoder_caches(
+        self,
+        caches: list["ASRCacheState"],  # noqa: F821
+    ) -> tuple["torch.Tensor | None", "torch.Tensor | None", "torch.Tensor | None"]:
+        """Concatenate per-session encoder caches along the batch dimension (dim=1).
+
+        Returns (None, None, None) when all caches are None so NeMo initialises
+        its own zero caches. Slots that are None (new sessions joining an ongoing
+        batch) are filled with zeros matching the first non-None cache shape.
+
+        Args:
+            caches: Per-session ASRCacheState objects.
+
+        Returns:
+            Tuple of (att_cache, conv_cache, att_cache_len), each None or batched.
+        """
+        att_caches = [c.att_cache for c in caches]
+        if all(a is None for a in att_caches):
+            return None, None, None
+
+        conv_caches = [c.conv_cache for c in caches]
+        att_lens = [c.att_cache_len for c in caches]
+
+        ref_att = next(a for a in att_caches if a is not None)
+        ref_conv = next(c for c in conv_caches if c is not None)
+        ref_len = next(l for l in att_lens if l is not None)
+
+        att_list = [a if a is not None else torch.zeros_like(ref_att) for a in att_caches]
+        conv_list = [c if c is not None else torch.zeros_like(ref_conv) for c in conv_caches]
+        len_list = [l if l is not None else torch.zeros_like(ref_len) for l in att_lens]
+
+        return (
+            torch.cat(att_list, dim=1),
+            torch.cat(conv_list, dim=1),
+            torch.cat(len_list, dim=1),
+        )
 
 
+def _extract_text(item) -> str:
+    """Extract plain text from a NeMo RNNT Hypothesis or CTC string."""
+    if item is None:
+        return ""
+    if isinstance(item, str):
+        return item
+    return getattr(item, "text", "") or ""

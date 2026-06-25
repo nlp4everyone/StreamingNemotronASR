@@ -67,10 +67,15 @@ class Settings(BaseSettings):
     decoding_strategy: str = "greedy_batch"
     # Max tokens the RNNT decoder emits per encoder frame. Raise if words get cut off.
     max_symbols_per_step: int = 10
+    # Number of independent model instances. Each inference call acquires one
+    # exclusively — eliminates the lang-prompt race condition for multi-language use.
+    # Keep at 1 unless per-instance CUDA streams are implemented; concurrent CUDA
+    # kernels from pool_size>1 cause illegal memory access on shared-context devices.
+    model_pool_size: int = 1
 
     # ── Behaviour ──────────────────────────────────────────────
     end_of_speech_timeout_s: float = 3.0
-    thread_pool_workers: int = 4
+    thread_pool_workers: int = 2
 
     @field_validator("streaming_preset")
     @classmethod
