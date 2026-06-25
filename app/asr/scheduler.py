@@ -46,7 +46,9 @@ class BatchScheduler:
             max_workers=settings.thread_pool_workers,
             thread_name_prefix="nemo-infer",
         )
-        self._queue: asyncio.Queue[_Request] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Request] = asyncio.Queue(
+            maxsize=settings.max_sessions * settings.max_pending_per_session
+        )
         self._worker: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 

@@ -67,6 +67,10 @@ class StreamingSession:
     last_sample_rate: int = 16000
     created_at: float = field(default_factory=time.monotonic)
     last_activity: float = field(default_factory=time.monotonic)
+    # Number of inference requests currently queued or in-flight for this session.
+    # Incremented before submit(), decremented in finally — asyncio single-thread
+    # guarantees no race between the check and the increment.
+    pending_infer: int = 0
     # Pending EOS-timeout task; cancelled and recreated on every audio packet.
     eos_task: asyncio.Task | None = field(default=None, repr=False)
 

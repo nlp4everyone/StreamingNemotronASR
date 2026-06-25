@@ -75,6 +75,10 @@ class Settings(BaseSettings):
 
     # ── Behaviour ──────────────────────────────────────────────
     end_of_speech_timeout_s: float = 3.0
+    # Max inference requests in-flight per session. Non-final chunks beyond this
+    # are dropped silently — keeps the queue bounded and sessions current.
+    # 1 = strictest (no queuing), 2 = one batch_timeout worth of buffer.
+    max_pending_per_session: int = 2
     thread_pool_workers: int = 2
 
     @field_validator("streaming_preset")

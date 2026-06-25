@@ -105,13 +105,20 @@ class StreamingHandler:
         """Submit a chunk to the scheduler and emit the result if the transcript changed.
 
         Partials are suppressed when the text is identical to the previous partial
-        to avoid redundant WebSocket frames.
+        to avoid redundant WebSocket frames. Non-final chunks are dropped when the
+        session already has max_pending_per_session requests in-flight, keeping the
+        queue bounded and the session current without blocking other sessions.
 
         Args:
             session: The active streaming session owning the ASR cache.
             chunk: Raw int16 PCM audio to transcribe.
             is_final: If True, emit a final transcript and include utterance duration.
         """
+        if not is_final and session.pending_infer >= settings.max_pending_per_session:
+            logger.debug("dropping chunk — session=%s pending=%d", session.session_id, session.pending_infer)
+            return
+
+        session.pending_infer += 1
         try:
             text, new_cache = await services.scheduler.submit(
                 chunk, session.last_sample_rate, session.cache, session.lang
@@ -119,6 +126,8 @@ class StreamingHandler:
         except Exception:
             logger.exception("inference error session=%s", session.session_id)
             return
+        finally:
+            session.pending_infer -= 1
 
         session.cache = new_cache
 
