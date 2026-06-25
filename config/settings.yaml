@@ -7,21 +7,21 @@
 #
 # Override via env:  ASR_STREAMING_PRESET=high
 # Override locally:  create config/settings.local.yaml (gitignored)
-streaming_preset: high
+streaming_preset: balanced
 
 # ── Batch inference ───────────────────────────────────────────────────────────
 # per_session: immediate inference per session (simple, lowest added latency)
 # dynamic    : collect up to max_batch_size sessions within batch_timeout_ms,
 #              then dispatch as one GPU call. Switch when sessions > 100 and
 #              GPU utilisation is below 50%.
-batch_mode: per_session
-max_batch_size: 8
-batch_timeout_ms: 20
+batch_mode: dynamic
+max_batch_size: 32
+batch_timeout_ms: 30
 
 # ── Server ────────────────────────────────────────────────────────────────────
 host: "0.0.0.0"
 port: 8000
-max_sessions: 50
+max_sessions: 200
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model_name: "nvidia/nemotron-3.5-asr-streaming-0.6b"
@@ -30,4 +30,4 @@ default_lang: "auto"
 
 # ── Behaviour ─────────────────────────────────────────────────────────────────
 end_of_speech_timeout_s: 3.0
-thread_pool_workers: 4
+thread_pool_workers: 8
