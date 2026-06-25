@@ -12,6 +12,9 @@ Framework nhận dạng giọng nói theo thời gian thực (Speech-to-Text), h
 - **Batch scheduling** — hỗ trợ `per_session` (inference ngay, latency tối thiểu) và `dynamic` (gom nhiều session vào một GPU call, tăng throughput)
 - **Non-blocking pipeline** — asyncio event loop xử lý toàn bộ I/O; GPU inference offload sang ThreadPoolExecutor, không block WebSocket connections
 - **Đa người dùng** — mỗi session giữ riêng cache tensors; VRAM được giải phóng ngay khi disconnect, không chờ GC; hard limit qua `ASR_MAX_SESSIONS`
+- **True GPU batching** — `dynamic` mode stack sessions vào một forward pass `[B, D, T]`; nhóm theo ngôn ngữ và decoder state
+- **Idle session cleanup** — sweeper evict ghost sessions (TCP alive, không có audio) sau `idle_timeout_s`; bổ sung WS ping/pong
+- **Bounded inference queue** — non-final chunks vượt `max_pending_per_session` bị drop; ngăn latency spiral
 
 <br />
 
@@ -28,8 +31,8 @@ Cấu hình trong `.env`:
 APP_PORT=8010
 
 ASR_STREAMING_PRESET=balanced
-ASR_BATCH_MODE=per_session
-ASR_MAX_SESSIONS=50
+ASR_BATCH_MODE=dynamic
+ASR_MAX_SESSIONS=200
 ASR_DEVICE=cuda
 ASR_DEFAULT_LANG=auto
 ```
@@ -112,6 +115,8 @@ make test-client WAV=resources/sample_vi.wav
 - [x] Per-session cache isolation + deterministic VRAM release
 - [x] Streaming presets (`ultra_low` → `high`) — đổi không cần rebuild
 - [x] Batch scheduler: `per_session` và `dynamic` mode
+- [x] True GPU batching trong `dynamic` mode (forward pass `[B, D, T]`)
+- [x] Model pool — loại bỏ race condition lang-prompt đa ngôn ngữ
 - [ ] INT8 quantization để giảm VRAM per session
 
 ### 🎤 Audio Pipeline
@@ -122,6 +127,8 @@ make test-client WAV=resources/sample_vi.wav
 ### 🛡️ Khả năng chịu lỗi
 - [x] Graceful shutdown + VRAM cleanup khi nhận SIGTERM
 - [x] Multi-stage Docker build (builder `cuda-devel` → runtime `cuda-runtime`)
+- [x] WS ping/pong cho dead TCP + idle sweeper cho ghost sessions
+- [x] Bounded inference queue per session (`max_pending_per_session`)
 - [ ] Lưu transcript đã hoàn thành xuống storage
 
 <br />

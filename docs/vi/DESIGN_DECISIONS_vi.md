@@ -80,17 +80,17 @@ NeMo cache-aware model xử lý audio theo từng chunk cố định. Mỗi sess
 
 ## 4. Concurrency — asyncio + ThreadPoolExecutor
 
-FastAPI's asyncio event loop xử lý toàn bộ WebSocket I/O (non-blocking). GPU inference là blocking CUDA call — được offload sang thread pool qua `run_in_executor` để không block event loop. Hai layer hoàn toàn tách biệt: I/O và compute chạy song song. Shared model state được bảo vệ bằng `threading.Lock` nhỏ chỉ bao quanh lời gọi thay đổi state, không bao quanh toàn bộ inference.
+FastAPI's asyncio event loop xử lý toàn bộ WebSocket I/O (non-blocking). GPU inference là blocking CUDA call — được offload sang thread pool qua `run_in_executor` để không block event loop. Engine duy trì pool `model_pool_size` instances độc lập; mỗi thread acquire một instance độc quyền — không cần `threading.Lock` cho language-prompt writes.
 
 ### Pros
 
 - **Nhiều connections đồng thời:** Event loop không bao giờ block vì inference — hàng chục WebSocket connections xử lý I/O đồng thời.
 - **Shared memory:** Threads chia sẻ process memory — cache tensors per-session không cần serialize, không có IPC overhead.
 - **CUDA release GIL:** Python GIL không block GPU work — thread pool thực sự song song hóa inference across sessions.
+- **Không có race condition lang-prompt:** Pool isolation đảm bảo `set_inference_prompt` và `conformer_stream_step` luôn chạy trên cùng một object.
 
 ### Cons
 
-- **Thread safety thủ công:** Shared state phải được bảo vệ rõ ràng bằng lock — dễ bị bỏ sót khi extend code.
 - **CUDA error handling phức tạp hơn:** Exception trong thread phải được propagate về coroutine chính — kém ergonomic hơn so với xử lý trực tiếp trong event loop.
 
 ### Alternatives considered
@@ -149,3 +149,43 @@ Mỗi WebSocket connection tạo một `StreamingSession` với cache tensors ri
 | Chỉ `per_session` | Lãng phí GPU khi nhiều sessions đồng thời — mỗi session chiếm một GPU call riêng dù GPU có thể xử lý nhiều hơn |
 | Chỉ `dynamic` | Thêm latency không cần thiết trong workload single-user hoặc session thấp |
 | Adaptive batching (tự điều chỉnh window) | Tăng complexity scheduler; chưa có dữ liệu profiling thực tế để calibrate |
+
+---
+
+## 7. Model Pool — pool-based instance isolation
+
+Pool `model_pool_size` instances độc lập (`queue.Queue`) thay thế thiết kế cũ (single instance + `threading.Lock`). Giữa `set_inference_prompt` và `conformer_stream_step` có một window mà thread khác có thể ghi đè language prompt lên shared instance — pool acquisition đóng window đó mà không cần lock.
+
+### Pros
+- **Không có race condition:** `set_inference_prompt` và `conformer_stream_step` chạy trên cùng object, không có write đồng thời.
+- **Code đơn giản hơn:** Không cần quản lý lock; pool semantics tường minh.
+
+### Cons
+- **VRAM nhân lên:** Mỗi instance tốn ~1.2 GB; `pool_size=2` tăng gấp đôi model VRAM.
+- **CUDA stream hazard khi pool_size > 1:** Concurrent kernels trên default stream gây illegal memory access — cần per-instance stream isolation trước khi bật.
+
+---
+
+## 8. Bounded inference queue per session
+
+Mỗi session theo dõi `pending_infer` (số request đang in-flight). Non-final chunks vượt `max_pending_per_session` bị drop. Ngăn queue depth tăng khi GPU throughput thấp hơn audio rate — giữ session current thay vì xử lý audio cũ.
+
+### Alternatives considered
+
+| Option | Reason not chosen |
+|---|---|
+| Unbounded queue | Queue phình to khi GPU chậm; latency tăng dần; xử lý audio cũ sau khi audio mới đã đến |
+| Block sender | Sẽ stall asyncio event loop và delay toàn bộ sessions khác |
+
+---
+
+## 9. Idle session sweeper
+
+Background asyncio task poll mỗi `session_sweep_interval_s` (default 30s), evict sessions im lặng quá `idle_timeout_s` (default 60s). Bổ sung uvicorn WS ping/pong (xử lý dead TCP); sweeper xử lý trường hợp "ghost session" — TCP alive nhưng client không gửi audio.
+
+### Alternatives considered
+
+| Option | Reason not chosen |
+|---|---|
+| Chỉ dùng WS ping/pong | Ping/pong phát hiện dead TCP; không phát hiện được TCP alive nhưng không có audio |
+| Client tự đóng session | Yêu cầu mọi client implement teardown đúng; không thể enforce |

@@ -238,8 +238,8 @@ asyncio event loop (main thread)
 - `asyncio` handles all I/O (WebSocket recv/send) — non-blocking
 - GPU inference is a synchronous CUDA call → must run in thread pool
 - `loop.run_in_executor(thread_pool, engine.stream_step, ...)` — non-blocking await
-- Thread pool size = `max_sessions` (each session can infer concurrently)
-- Model weights are read-only → multiple threads sharing one model instance is safe
+- Thread pool size = `thread_pool_workers` (default 2; one thread can preprocess while another holds the model)
+- Model pool (`model_pool_size` instances) — each thread acquires an instance exclusively; no `threading.Lock` needed
 
 **No `asyncio.Queue` per-session** (unlike DETAILED_COMPONENTS.md) because there is no VAD or adaptive pacing. Simple flow: packet arrives → chunk full → infer immediately.
 
@@ -263,8 +263,8 @@ asyncio event loop (main thread)
               └────────────┘ ← ready for next utterance
 
                     ┌──────▼──────┐
-                    │   CLOSED    │ ← WS disconnect, GPU cache released
-                    └─────────────┘
+                    │   CLOSED    │ ← WS disconnect OR idle sweeper eviction
+                    └─────────────┘  GPU cache released immediately
 ```
 
 **Note:** A single session can have multiple utterances (multiple STREAMING→FINALIZING cycles) within one WebSocket connection lifetime. Cache is **reset after each final**, not after each disconnect — this is the correct behavior for continuous speech.
@@ -325,6 +325,9 @@ With `balanced` preset (560ms): user sees transcript ~575–620ms after the star
 |---|---|---|
 | FastAPI + uvicorn | Native WebSocket, asyncio, HTTP endpoint included | aiohttp: less ergonomic; bare websockets: no routing |
 | asyncio + ThreadPoolExecutor | GPU call is blocking; executor frees event loop | asyncio.Queue per-session: more complex, unnecessary without VAD |
+| Model pool (not singleton) | Pool-based exclusive acquisition eliminates lang-prompt race condition for multi-lang | Single shared model + Lock: race window between set_inference_prompt and conformer_stream_step |
+| Bounded inference queue per session | Drops stale non-final chunks; prevents queue bloat under slow GPU | Unbounded queue: back-pressure causes latency spiral |
+| Idle session sweeper | Reclaims VRAM from ghost sessions (TCP alive, no audio); complements WS ping/pong | Rely on ping/pong only: doesn't handle soft "client went silent" case |
 | JSON text frames + base64 | Browser-friendly, debuggable; 33% overhead acceptable | Binary WS frames: more efficient but more complex; add later if needed |
 | Per-session cache tensors | Model is cache-aware by design; att_cache cannot be shared | Stateless inference (re-encode from scratch each chunk): loses left context |
 | No VAD | Cache-aware model handles silence naturally (empty output); reduces complexity | Silero VAD: add later as GPU optimization |

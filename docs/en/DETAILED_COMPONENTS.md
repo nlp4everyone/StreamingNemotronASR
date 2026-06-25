@@ -32,6 +32,7 @@ Per-message orchestrator. Stateless — all state lives in `StreamingSession`.
 - Decodes base64 → PCM bytes; decode error → `send_error("DECODE_ERROR", ...)`
 - `session.audio_buffer.push()` — if buffer has a full chunk, calls `_infer_and_emit(is_final=False)`
 - Partial transcript is only sent when `text != last_partial` (avoids no-op frames)
+- Non-final chunks are dropped when `session.pending_infer >= max_pending_per_session` (keeps queue bounded)
 
 `handle_end(session)`:
 - Cancels EOS timer
@@ -64,12 +65,14 @@ Singleton container holding all application-level services. Properties raise `Ru
 
 Initializes services in dependency order and releases resources on shutdown.
 
-`startup()` — three sequential steps:
+`startup()` — four sequential steps:
 1. `SessionManager()` — lightweight, no I/O; must run first so engine/scheduler can reference it
-2. `NemoStreamingEngine().load()` — downloads (~1–2 GB on first run) and loads model weights onto device; this is the most time-consuming step
+2. `NemoStreamingEngine().load()` — downloads (~1–2 GB on first run) and loads `model_pool_size` model instances onto device; this is the most time-consuming step
 3. `BatchScheduler(engine).start()` — initializes ThreadPoolExecutor; if `batch_mode=dynamic`, starts a background batch worker task
+4. `_sweep_idle_sessions()` — background task that evicts sessions silent longer than `idle_timeout_s`
 
 `shutdown()`:
+- Cancels and awaits the idle sweeper task
 - `scheduler.stop()` — cancels worker task, shuts down thread pool (cancels pending futures)
 
 ## SessionManager (`app/session/manager.py`)
@@ -79,6 +82,7 @@ A `dict[UUID, StreamingSession]` registry. Thread-safe within the asyncio single
 - `create(session)` — registers a new session in the registry
 - `get(session_id)` → `StreamingSession | None`
 - `remove(session_id)` — removes the session and **immediately releases GPU cache** (nulls out all tensor fields in `ASRCacheState` before GC has a chance to run)
+- `evict(session_id)` — cancels the session's pending EOS timer, then calls `remove()`; used by the idle sweeper
 - `count()` → number of currently active sessions (used to check capacity limit)
 
 ## StreamingSession (`app/session/state.py`)
@@ -105,6 +109,7 @@ pred_out: torch.Tensor | None       # RNNT decoder previous token output
 `StreamingSession`:
 - `audio_buffer`, `cache`, `transcript` — three core session components
 - `lang`, `last_sample_rate` — metadata from the most recent audio packet
+- `pending_infer` — count of inference requests currently queued or in-flight
 - `eos_task` — pending EOS timeout task; cancelled and recreated on each packet
 - `touch()` — updates `last_activity` (called on every packet)
 - `idle_seconds` — time elapsed since the last packet
@@ -122,23 +127,20 @@ Accumulates 20ms PCM int16 packets from the client; flushes when one inference c
 
 ## NemoStreamingEngine (`app/asr/engine.py`)
 
-Wrapper around `nvidia/nemotron-3.5-asr-streaming-0.6b`. Singleton, loaded once at startup; weights are read-only thereafter. Called from a `ThreadPoolExecutor` (blocking CUDA call).
+Wrapper around `nvidia/nemotron-3.5-asr-streaming-0.6b`. Maintains a pool of `model_pool_size` independent instances (`queue.Queue`). Each inference call acquires one exclusively — eliminates the lang-prompt race condition without a `threading.Lock`.
 
-`load()` — initializes the model in 5 steps:
+`load()` — loads N instances via `_load_one()`:
 1. `ASRModel.from_pretrained()` on the configured device
 2. `.eval()` — disables dropout/batch-norm
 3. `set_default_att_context_size()` — applies look-ahead frames from the preset
 4. `change_decoding_strategy()` if not already `greedy_batch`
 5. `set_inference_prompt()` — sets the default language (**required** — omitting this causes the model to return empty strings)
 
-`stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`:
-1. Preprocess: int16 → float32 → resample if needed → log-mel via model's preprocessor
-2. Set language prompt (uses `threading.Lock` because this is shared model state)
-3. `conformer_stream_step()` → returns 6 values: greedy predictions, transcripts, new att_cache, new conv_cache, new att_cache_len, best_hyp
-4. Extract text (RNNT returns a `Hypothesis` object, CTC returns a `str`)
-5. Pack new `ASRCacheState` and return
+> `model_pool_size > 1` requires per-instance CUDA stream isolation; leave at 1 until implemented.
 
-`stream_step_batch(requests)` — runs multiple sessions sequentially in one call (placeholder for true GPU batching B > 1).
+`stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`: acquires instance → preprocess → set lang → `conformer_stream_step` → return instance in `finally`.
+
+`stream_step_batch(requests)` — true GPU batching: groups requests by `(lang, has_decoder_state)` for homogeneous cache shapes, calls `_batch_infer()` per group. Stacks mels `[B, D, T_max]` and caches along batch dim; single `conformer_stream_step(B>1)` call per group.
 
 ## BatchScheduler (`app/asr/scheduler.py`)
 

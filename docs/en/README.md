@@ -12,6 +12,9 @@ A production-ready multi-user streaming Speech-to-Text framework built on FastAP
 - **Batch scheduling** — supports `per_session` (infer immediately, minimum latency) and `dynamic` (batch multiple sessions into one GPU call, higher throughput)
 - **Non-blocking pipeline** — asyncio event loop handles all I/O; GPU inference offloaded to ThreadPoolExecutor, does not block WebSocket connections
 - **Multi-user** — each session holds its own cache tensors; VRAM released immediately on disconnect, no waiting for GC; hard limit via `ASR_MAX_SESSIONS`
+- **True GPU batching** — `dynamic` mode stacks sessions into a single `[B, D, T]` forward pass; groups by language and decoder state for homogeneous batches
+- **Idle session cleanup** — background sweeper evicts ghost sessions (TCP alive, no audio) after `idle_timeout_s`; complements WS ping/pong for dead TCP
+- **Bounded inference queue** — non-final chunks beyond `max_pending_per_session` are dropped; prevents latency spiral under GPU load
 
 <br />
 
@@ -28,8 +31,8 @@ Configure in `.env`:
 APP_PORT=8010
 
 ASR_STREAMING_PRESET=balanced
-ASR_BATCH_MODE=per_session
-ASR_MAX_SESSIONS=50
+ASR_BATCH_MODE=dynamic
+ASR_MAX_SESSIONS=200
 ASR_DEVICE=cuda
 ASR_DEFAULT_LANG=auto
 ```
@@ -112,6 +115,8 @@ make test-client WAV=resources/sample_vi.wav
 - [x] Per-session cache isolation + deterministic VRAM release
 - [x] Streaming presets (`ultra_low` → `high`) — switch without rebuild
 - [x] Batch scheduler: `per_session` and `dynamic` mode
+- [x] True GPU batching in `dynamic` mode (`[B, D, T]` forward pass)
+- [x] Model pool — eliminates lang-prompt race condition for multi-language
 - [ ] INT8 quantization to reduce VRAM per session
 
 ### 🎤 Audio Pipeline
@@ -122,6 +127,8 @@ make test-client WAV=resources/sample_vi.wav
 ### 🛡️ Resilience
 - [x] Graceful shutdown + VRAM cleanup on SIGTERM
 - [x] Multi-stage Docker build (builder `cuda-devel` → runtime `cuda-runtime`)
+- [x] WS ping/pong for dead TCP detection + idle sweeper for ghost sessions
+- [x] Bounded inference queue per session (`max_pending_per_session`)
 - [ ] Persist completed transcripts to storage
 
 <br />

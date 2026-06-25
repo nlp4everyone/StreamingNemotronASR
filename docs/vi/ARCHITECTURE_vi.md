@@ -238,8 +238,8 @@ asyncio event loop (main thread)
 - `asyncio` xử lý toàn bộ I/O (WebSocket recv/send) — không blocking
 - GPU inference là synchronous CUDA call → phải chạy trong thread pool
 - `loop.run_in_executor(thread_pool, engine.stream_step, ...)` — non-blocking await
-- Thread pool size = `max_sessions` (mỗi session có thể inference đồng thời)
-- Model weights là read-only → nhiều thread cùng dùng một model instance là safe
+- Thread pool size = `thread_pool_workers` (default 2)
+- Model pool (`model_pool_size` instances) — mỗi thread acquire một instance độc quyền; không cần `threading.Lock`
 
 **Không dùng `asyncio.Queue` per-session** (như DETAILED_COMPONENTS.md) vì không có VAD/adaptive pacing. Flow đơn giản: packet đến → đủ chunk → inference ngay.
 
@@ -263,8 +263,8 @@ asyncio event loop (main thread)
               └────────────┘ ← sẵn sàng utterance tiếp theo
 
                     ┌──────▼──────┐
-                    │   CLOSED    │ ← WS disconnect, GPU cache giải phóng
-                    └─────────────┘
+                    │   CLOSED    │ ← WS disconnect HOẶC idle sweeper evict
+                    └─────────────┘  GPU cache giải phóng ngay
 ```
 
 **Lưu ý:** Một session có thể có nhiều utterances (nhiều chu kỳ STREAMING→FINALIZING) trong vòng đời của một WebSocket connection. Cache được **reset sau mỗi final**, không phải sau mỗi disconnect — đây là hành vi đúng cho continuous speech.
@@ -331,5 +331,8 @@ Với preset `balanced` (560ms): user thấy transcript sau ~575–620ms kể t�
 | Không dùng ring buffer | Không cần replay audio; model tự giữ context qua att_cache | Ring buffer 12s: cần cho VAD trim/final window extraction |
 | Preset system (named) | Đổi một env var, toàn pipeline điều chỉnh; tránh config không nhất quán | Trực tiếp cấu hình att_context_size: dễ làm sai chunk_size tương ứng |
 | Emit partial chỉ khi text thay đổi | Tránh no-op WebSocket messages; giảm tải client render | Emit mỗi chunk bất kể: đơn giản hơn nhưng lãng phí bandwidth |
+| Model pool (không phải singleton) | Pool-based exclusive acquisition loại bỏ race condition lang-prompt | Single model + Lock: vẫn có race window giữa set_inference_prompt và conformer_stream_step |
+| Bounded inference queue per session | Drop chunk lỗi thời, ngăn latency spiral khi GPU chậm | Unbounded queue: queue phình to, latency tăng dần |
+| Idle session sweeper | Thu hồi VRAM từ ghost sessions (TCP alive, không có audio); bổ sung WS ping/pong | Chỉ dùng ping/pong: không xử lý được soft "client im lặng" |
 
 ---

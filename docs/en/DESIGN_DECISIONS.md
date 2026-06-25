@@ -80,17 +80,17 @@ The NeMo cache-aware model processes audio in fixed-size chunks. Each session ho
 
 ## 4. Concurrency — asyncio + ThreadPoolExecutor
 
-FastAPI's asyncio event loop handles all WebSocket I/O (non-blocking). GPU inference is a blocking CUDA call — offloaded to a thread pool via `run_in_executor` so it does not block the event loop. The two layers are completely separate: I/O and compute run in parallel. Shared model state is protected by a small `threading.Lock` that wraps only the state-mutation call, not the entire inference.
+FastAPI's asyncio event loop handles all WebSocket I/O (non-blocking). GPU inference is a blocking CUDA call — offloaded to a thread pool via `run_in_executor` so it does not block the event loop. The two layers are completely separate: I/O and compute run in parallel. The engine maintains a pool of `model_pool_size` independent instances; each thread acquires one exclusively — no `threading.Lock` needed for language-prompt writes.
 
 ### Pros
 
 - **Many concurrent connections:** Event loop never blocks on inference — dozens of WebSocket connections process I/O simultaneously.
 - **Shared memory:** Threads share process memory — per-session cache tensors need no serialization and have no IPC overhead.
 - **CUDA releases the GIL:** The Python GIL does not block GPU work — the thread pool genuinely parallelizes inference across sessions.
+- **No lang-prompt race:** Pool isolation guarantees `set_inference_prompt` and `conformer_stream_step` always run on the same model object.
 
 ### Cons
 
-- **Manual thread safety:** Shared state must be explicitly protected with locks — easy to miss when extending code.
 - **CUDA error handling is less ergonomic:** Exceptions in threads must be propagated back to the main coroutine — less clean than handling directly in the event loop.
 
 ### Alternatives considered
@@ -149,3 +149,43 @@ Each WebSocket connection creates a `StreamingSession` with its own cache tensor
 | `per_session` only | Wastes GPU when many sessions are active — each session occupies its own GPU call even when the GPU could handle more |
 | `dynamic` only | Adds unnecessary latency in single-user or low-session workloads |
 | Adaptive batching (self-adjusting window) | Increases scheduler complexity; no real profiling data yet to calibrate |
+
+---
+
+## 7. Model Pool — pool-based instance isolation
+
+A `queue.Queue` of `model_pool_size` independent model instances replaces the previous single-instance + `threading.Lock` design. Between `set_inference_prompt` and `conformer_stream_step` there is a window where another thread could overwrite the language prompt on a shared instance — pool acquisition closes that window without a lock.
+
+### Pros
+- **No race condition:** `set_inference_prompt` and `conformer_stream_step` execute on the same object with no concurrent writes.
+- **Simpler code:** No lock management; pool semantics are explicit.
+
+### Cons
+- **VRAM multiplied:** Each instance costs ~1.2 GB; `pool_size=2` doubles model VRAM.
+- **CUDA stream hazard at pool_size > 1:** Concurrent kernels on the default stream cause illegal memory access — requires per-instance stream isolation before enabling.
+
+---
+
+## 8. Bounded inference queue per session
+
+Each session tracks `pending_infer` (in-flight count). Non-final chunks beyond `max_pending_per_session` are dropped. Prevents queue depth from growing when GPU throughput falls behind audio rate — keeps the session current rather than processing stale audio.
+
+### Alternatives considered
+
+| Option | Reason not chosen |
+|---|---|
+| Unbounded queue | Queue grows under slow GPU; latency spirals; old audio processed after new audio arrives |
+| Block sender | Would stall the asyncio event loop and delay all other sessions |
+
+---
+
+## 9. Idle session sweeper
+
+A background asyncio task polls every `session_sweep_interval_s` (default 30s) and evicts sessions silent longer than `idle_timeout_s` (default 60s). Complements uvicorn WS ping/pong (which handles dead TCP); the sweeper handles the "ghost session" case where TCP is alive but the client stopped sending audio.
+
+### Alternatives considered
+
+| Option | Reason not chosen |
+|---|---|
+| Rely on WS ping/pong only | Ping/pong detects dead TCP; it does not detect a live TCP connection with no audio activity |
+| Client-driven session close | Requires all clients to implement proper teardown; not enforceable |

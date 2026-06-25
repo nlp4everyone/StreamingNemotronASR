@@ -32,6 +32,7 @@ Orchestrator per-message. Stateless — toàn bộ state nằm trong `StreamingS
 - Decode base64 → PCM bytes; lỗi decode → `send_error("DECODE_ERROR", ...)`
 - `session.audio_buffer.push()` — nếu buffer đủ chunk, gọi `_infer_and_emit(is_final=False)`
 - Partial transcript chỉ được gửi khi `text != last_partial` (tránh no-op frame)
+- Non-final chunks bị drop khi `session.pending_infer >= max_pending_per_session` (giữ queue bounded)
 
 `handle_end(session)`:
 - Hủy EOS timer
@@ -64,12 +65,14 @@ Container singleton giữ tất cả application-level services. Properties rais
 
 Khởi tạo services theo thứ tự dependency và giải phóng tài nguyên khi shutdown.
 
-`startup()` — ba bước tuần tự:
+`startup()` — bốn bước tuần tự:
 1. `SessionManager()` — lightweight, không I/O; phải chạy trước để engine/scheduler có thể tham chiếu
-2. `NemoStreamingEngine().load()` — download (~1–2 GB lần đầu) và load model weights lên device; đây là bước tốn thời gian nhất
+2. `NemoStreamingEngine().load()` — download (~1–2 GB lần đầu) và load `model_pool_size` model instances lên device; đây là bước tốn thời gian nhất
 3. `BatchScheduler(engine).start()` — khởi tạo ThreadPoolExecutor; nếu `batch_mode=dynamic`, khởi động background batch worker task
+4. `_sweep_idle_sessions()` — background task evict sessions im lặng quá `idle_timeout_s`
 
 `shutdown()`:
+- Hủy và await idle sweeper task
 - `scheduler.stop()` — hủy worker task, shutdown thread pool (cancel pending futures)
 
 ## SessionManager (`app/session/manager.py`)
@@ -79,6 +82,7 @@ Registry `dict[UUID, StreamingSession]`. Thread-safe trong asyncio single-thread
 - `create(session)` — đăng ký session mới vào registry
 - `get(session_id)` → `StreamingSession | None`
 - `remove(session_id)` — xóa session và **giải phóng GPU cache ngay** (null out toàn bộ tensor fields trong `ASRCacheState` trước khi GC có cơ hội chạy)
+- `evict(session_id)` — hủy EOS timer của session, sau đó gọi `remove()`; dùng bởi idle sweeper
 - `count()` → số session đang active (dùng để kiểm tra capacity limit)
 
 ## StreamingSession (`app/session/state.py`)
@@ -105,6 +109,7 @@ pred_out: torch.Tensor | None       # RNNT decoder previous token output
 `StreamingSession`:
 - `audio_buffer`, `cache`, `transcript` — ba thành phần core của session
 - `lang`, `last_sample_rate` — metadata từ audio packet gần nhất
+- `pending_infer` — số inference requests đang queued hoặc in-flight
 - `eos_task` — pending EOS timeout task; bị hủy và tạo lại mỗi packet
 - `touch()` — cập nhật `last_activity` (gọi trên mỗi packet)
 - `idle_seconds` — thời gian kể từ packet cuối cùng
@@ -122,23 +127,20 @@ Tích lũy PCM int16 packets 20ms từ client; flush khi đủ một inference c
 
 ## NemoStreamingEngine (`app/asr/engine.py`)
 
-Wrapper quanh `nvidia/nemotron-3.5-asr-streaming-0.6b`. Singleton, load một lần khi startup, weights read-only sau đó. Gọi từ `ThreadPoolExecutor` (blocking CUDA call).
+Wrapper quanh `nvidia/nemotron-3.5-asr-streaming-0.6b`. Duy trì pool gồm `model_pool_size` model instances độc lập (`queue.Queue`). Mỗi inference call acquire một instance độc quyền — loại bỏ race condition lang-prompt, không cần `threading.Lock`.
 
-`load()` — khởi tạo model theo 5 bước:
+`load()` — load N instances qua `_load_one()`:
 1. `ASRModel.from_pretrained()` trên configured device
 2. `.eval()` — tắt dropout/batch-norm
 3. `set_default_att_context_size()` — áp dụng look-ahead frames từ preset
 4. `change_decoding_strategy()` nếu khác `greedy_batch`
 5. `set_inference_prompt()` — set ngôn ngữ mặc định (**bắt buộc** — thiếu thì model trả chuỗi rỗng)
 
-`stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`:
-1. Preprocess: int16 → float32 → resample nếu cần → log-mel qua model's preprocessor
-2. Set language prompt (dùng `threading.Lock` vì là shared model state)
-3. `conformer_stream_step()` → trả về 6 giá trị: greedy predictions, transcripts, att_cache mới, conv_cache mới, att_cache_len mới, best_hyp
-4. Extract text (RNNT trả `Hypothesis` object, CTC trả `str`)
-5. Pack `ASRCacheState` mới và trả về
+> `model_pool_size > 1` yêu cầu per-instance CUDA stream isolation; giữ ở 1 cho đến khi triển khai xong.
 
-`stream_step_batch(requests)` — chạy nhiều session tuần tự trong một call (placeholder cho true GPU batching B > 1).
+`stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`: acquire instance → preprocess → set lang → `conformer_stream_step` → trả instance trong `finally`.
+
+`stream_step_batch(requests)` — true GPU batching: nhóm requests theo `(lang, has_decoder_state)` để đảm bảo homogeneous cache shapes, gọi `_batch_infer()` mỗi nhóm. Stack mels `[B, D, T_max]` và caches theo batch dim; một `conformer_stream_step(B>1)` call per nhóm.
 
 ## BatchScheduler (`app/asr/scheduler.py`)
 
