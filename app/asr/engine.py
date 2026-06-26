@@ -2,7 +2,6 @@ import logging
 import queue
 import time
 from collections import defaultdict
-
 import numpy as np
 import torch
 import torchaudio
@@ -103,6 +102,10 @@ class NemoStreamingEngine:
 
     def is_ready(self) -> bool:
         return self._loaded
+
+    @property
+    def bf16_enabled(self) -> bool:
+        return self._use_bf16
 
     def _to_encoder_dtype(self, mel: torch.Tensor) -> torch.Tensor:
         """Cast mel features to match encoder weight dtype when bf16 is enabled."""

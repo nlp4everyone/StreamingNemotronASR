@@ -13,6 +13,7 @@ services:
     # hf-cache: HuggingFace model weights (persisted across restarts)
     # nemo-cache: NeMo intermediate files
     volumes:
+      - ..:/app
       - hf-cache:/cache/huggingface
       - nemo-cache:/cache/nemo
 

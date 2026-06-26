@@ -116,6 +116,8 @@ class StreamingHandler:
         """
         if not is_final and session.pending_infer >= settings.max_pending_per_session:
             logger.debug("dropping chunk — session=%s pending=%d", session.session_id, session.pending_infer)
+            from app.services.metrics import stats
+            stats.record_drop()
             return
 
         session.pending_infer += 1

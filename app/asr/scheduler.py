@@ -54,6 +54,10 @@ class BatchScheduler:
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
+    def queue_depth(self) -> int:
+        """Current number of inference requests waiting in the queue."""
+        return self._queue.qsize()
+
     async def start(self) -> None:
         """Capture the event loop and, in dynamic mode, launch the batch worker task."""
         self._loop = asyncio.get_running_loop()
@@ -122,7 +126,11 @@ class BatchScheduler:
         Returns:
             Tuple of (transcript_text, updated_cache).
         """
-        return await self._loop.run_in_executor(
+        import time
+        from app.services.metrics import stats
+
+        t0 = time.perf_counter()
+        result = await self._loop.run_in_executor(
             self._thread_pool,
             self._engine.stream_step,
             pcm_bytes,
@@ -130,6 +138,8 @@ class BatchScheduler:
             cache,
             lang,
         )
+        stats.record_batch(1, (time.perf_counter() - t0) * 1000)
+        return result
 
     # ── dynamic batching path ──────────────────────────────────────────────────
 
@@ -181,16 +191,21 @@ class BatchScheduler:
             Exception: Any engine error is caught, logged, and forwarded to
                 each request's future so callers receive the exception.
         """
+        import time
+        from app.services.metrics import stats
+
         try:
             # 1. unpack requests into engine-friendly tuples
             requests = [(r.pcm_bytes, r.sample_rate, r.cache, r.lang) for r in batch]
 
             # 2. run blocking inference in the thread pool
+            t0 = time.perf_counter()
             results = await self._loop.run_in_executor(
                 self._thread_pool,
                 self._engine.stream_step_batch,
                 requests,
             )
+            stats.record_batch(len(batch), (time.perf_counter() - t0) * 1000)
 
             # 3. resolve each caller's future with its result
             for req, result in zip(batch, results):
