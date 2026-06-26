@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     # kernels from pool_size>1 cause illegal memory access on shared-context devices.
     model_pool_size: int = 1
 
+    # ── Precision ──────────────────────────────────────────────
+    # Cast encoder + decoder weights to bfloat16 after loading — halves VRAM for
+    # weights and session caches. Preprocessor stays float32; mel is cast to bfloat16
+    # just before the encoder forward pass. Requires Ampere+ GPU (A100, RTX 30xx+, A10G).
+    # false: all weights in float32 (safe on any GPU including CPU)
+    # true : encoder+decoder in bfloat16 (falls back to float32 if GPU lacks support)
+    use_bf16: bool = False
+
     # ── Behaviour ──────────────────────────────────────────────
     end_of_speech_timeout_s: float = 3.0
     # Idle session cleanup: evict sessions silent longer than idle_timeout_s.

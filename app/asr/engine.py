@@ -26,12 +26,14 @@ class NemoStreamingEngine:
         self._pool: queue.Queue = queue.Queue()
         self._device = settings.device
         self._loaded = False
+        self._use_bf16: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def load(self) -> None:
         """Load model_pool_size instances onto the configured device."""
         n = settings.model_pool_size
+        self._use_bf16 = self._resolve_bf16()
         logger.info(
             "loading %d instance(s) of %s on %s ...", n, settings.model_name, self._device
         )
@@ -40,13 +42,25 @@ class NemoStreamingEngine:
             self._pool.put(self._load_one(i, n))
         self._loaded = True
         logger.info(
-            "model pool ready (%d instances) in %.1fs — preset=%s att_context=%s lang=%s",
+            "model pool ready (%d instances) in %.1fs — preset=%s att_context=%s lang=%s bf16=%s",
             n,
             time.perf_counter() - t0,
             settings.preset.name,
             settings.preset.att_context_size,
             settings.default_lang,
+            self._use_bf16,
         )
+
+    def _resolve_bf16(self) -> bool:
+        """Return True only when bf16 is requested and the device supports it."""
+        if not settings.use_bf16 or self._device == "cpu":
+            return False
+        if not torch.cuda.is_bf16_supported():
+            logger.warning(
+                "use_bf16=true but GPU does not support bfloat16 — falling back to float32"
+            )
+            return False
+        return True
 
     def _load_one(self, idx: int, total: int):
         import nemo.collections.asr as nemo_asr
@@ -74,11 +88,25 @@ class NemoStreamingEngine:
         if hasattr(model, "set_inference_prompt"):
             model.set_inference_prompt(settings.default_lang)
 
+        if self._use_bf16:
+            # Cast the full model to bfloat16, then restore preprocessor to float32.
+            # Casting the full model avoids dtype mismatches across submodules (encoder,
+            # decoder, joint network, etc.). Preprocessor (filterbank + log-mel) must
+            # stay float32; mel is cast to bfloat16 just before the encoder forward pass.
+            # bfloat16 is safe: same exponent range as float32, attention softmax cannot overflow.
+            model.bfloat16()
+            model.preprocessor.float()
+            logger.info("instance %d/%d: model cast to bfloat16 (preprocessor kept float32)", idx + 1, total)
+
         logger.info("instance %d/%d ready in %.1fs", idx + 1, total, time.perf_counter() - t1)
         return model
 
     def is_ready(self) -> bool:
         return self._loaded
+
+    def _to_encoder_dtype(self, mel: torch.Tensor) -> torch.Tensor:
+        """Cast mel features to match encoder weight dtype when bf16 is enabled."""
+        return mel.bfloat16() if self._use_bf16 else mel
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
 
@@ -138,6 +166,7 @@ class NemoStreamingEngine:
         model = self._pool.get()
         try:
             mel, mel_len = self._preprocess(pcm_bytes, sample_rate, model)
+            mel = self._to_encoder_dtype(mel)
 
             if hasattr(model, "set_inference_prompt"):
                 model.set_inference_prompt(lang)
@@ -234,9 +263,9 @@ class NemoStreamingEngine:
         B = len(requests)
         model = self._pool.get()
         try:
-            # 1. preprocess per session
+            # 1. preprocess per session (float32), then cast to encoder dtype
             mels_lens = [self._preprocess(pcm, sr, model) for pcm, sr, _, _ in requests]
-            mels = [ml[0] for ml in mels_lens]
+            mels = [self._to_encoder_dtype(ml[0]) for ml in mels_lens]
             mel_lens = [ml[1] for ml in mels_lens]
 
             # 2. pad to T_max and stack → [B, D, T_max]

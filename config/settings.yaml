@@ -34,6 +34,18 @@ default_lang: "auto"
 #              after confirming GPU has >= 3 GB free VRAM beyond session caches.
 model_pool_size: 1
 
+# ── Precision ─────────────────────────────────────────────────────────────────
+# Cast encoder + decoder weights to bfloat16 after loading.
+# Preprocessor stays float32; mel is cast just before the encoder forward pass.
+#
+# use_bf16: true  → encoder+decoder in bfloat16 — halves weight VRAM + cache VRAM
+#                   per session. Requires Ampere+ GPU (A100, RTX 30xx+, A10G).
+#                   Falls back to float32 automatically if GPU lacks support.
+#           false → all weights in float32 (safe on any GPU including CPU)
+#
+# Disable with: ASR_USE_BF16=false
+use_bf16: false
+
 # ── Behaviour ─────────────────────────────────────────────────────────────────
 end_of_speech_timeout_s: 3.0
 # Non-final chunks are dropped when a session already has this many requests
