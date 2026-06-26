@@ -7,6 +7,7 @@ Application entry point. Initializes the FastAPI app, wires the lifespan, regist
 - `lifespan(app)` — calls `startup()` before accepting requests, `shutdown()` when the server stops
 - Registers `ws_router` containing the `/ws/stream` endpoint
 - `/health` — returns `model_ready`, `active_sessions`, `preset`, `batch_mode`
+- `/health/stats` — returns runtime metrics: `active_sessions`, `max_sessions`, `queue_depth`, `drop_count`, `inference_count`, `avg_batch_size`, `avg_gpu_batch_size`, `batch_latency_ms`, `bf16_enabled`
 
 ## WebSocket Router (`app/routers/websocket.py`)
 
@@ -135,12 +136,15 @@ Wrapper around `nvidia/nemotron-3.5-asr-streaming-0.6b`. Maintains a pool of `mo
 3. `set_default_att_context_size()` — applies look-ahead frames from the preset
 4. `change_decoding_strategy()` if not already `greedy_batch`
 5. `set_inference_prompt()` — sets the default language (**required** — omitting this causes the model to return empty strings)
+6. If `use_bf16=true` and GPU supports bfloat16: casts the full model to `bfloat16`, then restores preprocessor to `float32`. Mel features are cast to bfloat16 via `_to_encoder_dtype()` immediately before the encoder forward pass.
 
 > `model_pool_size > 1` requires per-instance CUDA stream isolation; leave at 1 until implemented.
 
+`_preprocess_batch(requests, model)` — batch preprocessing that stays in torch throughout: decodes each PCM chunk to a float32 `torch.Tensor`, resamples in-place if needed (no numpy roundtrip after resample), pads all tensors to `T_max` using `torch.zeros`, then runs one batched `model.preprocessor()` call. Returns `(mel_batch, mel_len_batch)` already cast to encoder dtype via `_to_encoder_dtype()`.
+
 `stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`: acquires instance → preprocess → set lang → `conformer_stream_step` → return instance in `finally`.
 
-`stream_step_batch(requests)` — true GPU batching: groups requests by `(lang, has_decoder_state)` for homogeneous cache shapes, calls `_batch_infer()` per group. Stacks mels `[B, D, T_max]` and caches along batch dim; single `conformer_stream_step(B>1)` call per group.
+`stream_step_batch(requests)` — true GPU batching: groups requests by `(lang, has_decoder_state)` for homogeneous cache shapes, calls `_batch_infer()` per group. Stacks mels `[B, D, T_max]` and caches along batch dim; single `conformer_stream_step(B>1)` call per group. Records actual GPU batch size via `stats.record_gpu_batch(B)` before each forward pass.
 
 ## BatchScheduler (`app/asr/scheduler.py`)
 
@@ -148,10 +152,19 @@ Routes inference requests to the engine. Mode is configured via `ASR_BATCH_MODE`
 
 `per_session` — each request is dispatched immediately via `loop.run_in_executor(thread_pool, engine.stream_step, ...)`.
 
-`dynamic` — requests are placed in an `asyncio.Queue`; a background worker collects up to `max_batch_size` requests within `batch_timeout_ms` then calls `engine.stream_step_batch()` once.
+`dynamic` — requests are placed in an `asyncio.Queue`; a background worker collects up to `max_batch_size` requests within `batch_timeout_ms` then calls `engine.stream_step_batch()` once. The worker uses a two-phase drain: immediately drains already-queued items with `get_nowait()` before entering an async wait, reducing event-loop overhead under burst load.
 
 - `submit(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)` — unified interface for both modes; the caller just `await`s without knowing the mode
 - `start()` / `stop()` — lifecycle; `stop()` cancels the worker task and shuts down the thread pool
+
+## Metrics (`app/services/metrics.py`)
+
+Module-level `stats` singleton. Thread-safe under the GIL for counter increments; all reads go through `snapshot()`.
+
+- `record_drop()` — increments `drop_count`
+- `record_batch(batch_size, latency_ms)` — increments `inference_count`; appends to a rolling deque of 200 `(scheduler_batch_size, latency_ms)` samples
+- `record_gpu_batch(batch_size)` — appends the actual `B` used in one `conformer_stream_step` call to a rolling deque of 500 samples; distinct from scheduler-level batch size because `stream_step_batch` splits requests into homogeneous language/state groups first
+- `snapshot()` — returns `avg_batch_size` (scheduler-level), `avg_gpu_batch_size` (GPU-level, post group-split), and `batch_latency_ms` with `p50`/`p99` over the rolling window
 
 ## Schema (`app/schema/`)
 

@@ -130,7 +130,7 @@ Mỗi WebSocket connection tạo một `StreamingSession` với cache tensors ri
 
 ## 6. Batch Scheduler — `per_session` và `dynamic`
 
-`BatchScheduler` hỗ trợ hai mode cấu hình qua env var. `per_session` inference ngay khi chunk của một session sẵn sàng — latency thấp nhất, phù hợp khi số sessions thấp. `dynamic` gom requests từ nhiều sessions trong một time window rồi thực hiện một GPU call — throughput cao hơn, chấp nhận thêm `batch_timeout_ms` latency. Chuyển mode không cần sửa code hay rebuild image.
+`BatchScheduler` hỗ trợ hai mode cấu hình qua env var. `per_session` inference ngay khi chunk của một session sẵn sàng — latency thấp nhất, phù hợp khi số sessions thấp. `dynamic` gom requests từ nhiều sessions trong một time window rồi thực hiện một GPU call — throughput cao hơn, chấp nhận thêm `batch_timeout_ms` latency. `_collect_batch()` dùng two-phase drain: sau khi block trên item đầu tiên, ngay lập tức drain hết items đã có sẵn bằng `get_nowait()` trước khi async wait các item còn lại — tránh event-loop round-trip dư thừa khi queue đã có sẵn nhiều requests. Chuyển mode không cần sửa code hay rebuild image.
 
 ### Pros
 
@@ -179,7 +179,21 @@ Mỗi session theo dõi `pending_infer` (số request đang in-flight). Non-fina
 
 ---
 
-## 9. Idle session sweeper
+## 10. Chế độ bfloat16
+
+Khi `use_bf16=true` và GPU hỗ trợ bfloat16 (Ampere+), toàn bộ model được cast sang `bfloat16` và preprocessor được restore về `float32`. Mel features được cast sang bfloat16 qua `_to_encoder_dtype()` ngay trước encoder forward pass. Cast toàn model một lần tránh mismatch dtype giữa các submodule (encoder, decoder, joint network). Preprocessor giữ float32 vì tính toán filterbank và log-mel cần độ chính xác float32; chỉ cần cast tường minh tại ranh giới đầu vào encoder.
+
+### Pros
+- **Giảm VRAM per instance:** bfloat16 giảm một nửa bộ nhớ model weight (~600 MB vs ~1.2 GB), dùng được trên GPU nhỏ hơn.
+- **Không có overflow risk:** bfloat16 có cùng dải exponent với float32 — attention softmax không thể overflow, khác với float16.
+
+### Cons
+- **Chỉ hỗ trợ Ampere+:** Fallback về float32 kèm warning trên GPU cũ hơn; `_resolve_bf16()` kiểm tra `torch.cuda.is_bf16_supported()` khi load.
+- **Chi phí cast tại ranh giới preprocessor:** Một lần cast tường minh per batch ở đầu vào encoder; chi phí không đáng kể trong thực tế.
+
+---
+
+## 11. Idle session sweeper
 
 Background asyncio task poll mỗi `session_sweep_interval_s` (default 30s), evict sessions im lặng quá `idle_timeout_s` (default 60s). Bổ sung uvicorn WS ping/pong (xử lý dead TCP); sweeper xử lý trường hợp "ghost session" — TCP alive nhưng client không gửi audio.
 

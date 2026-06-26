@@ -130,7 +130,7 @@ Each WebSocket connection creates a `StreamingSession` with its own cache tensor
 
 ## 6. Batch Scheduler — `per_session` and `dynamic`
 
-`BatchScheduler` supports two modes configured via env var. `per_session` infers immediately when a session's chunk is ready — lowest latency, suitable when session count is low. `dynamic` batches requests from multiple sessions within a time window and issues a single GPU call — higher throughput, accepts an additional `batch_timeout_ms` of latency. Switching mode requires no code changes or image rebuild.
+`BatchScheduler` supports two modes configured via env var. `per_session` infers immediately when a session's chunk is ready — lowest latency, suitable when session count is low. `dynamic` batches requests from multiple sessions within a time window and issues a single GPU call — higher throughput, accepts an additional `batch_timeout_ms` of latency. The `_collect_batch()` loop uses a two-phase drain: after blocking on the first item it immediately drains all already-queued items with `get_nowait()` before entering an async wait for stragglers — this avoids unnecessary event-loop round-trips under burst load. Switching mode requires no code changes or image rebuild.
 
 ### Pros
 
@@ -179,7 +179,21 @@ Each session tracks `pending_infer` (in-flight count). Non-final chunks beyond `
 
 ---
 
-## 9. Idle session sweeper
+## 10. bfloat16 precision mode
+
+When `use_bf16=true` and the GPU supports bfloat16 (Ampere+), the full model is cast to `bfloat16` and the preprocessor is restored to `float32`. Mel features are cast to bfloat16 via `_to_encoder_dtype()` immediately before the encoder forward pass. Casting the whole model up front avoids dtype mismatches across submodules (encoder, decoder, joint network). The preprocessor stays float32 because filterbank and log-mel computations require float32 precision; only the encoder input boundary needs explicit casting.
+
+### Pros
+- **Lower VRAM per instance:** bfloat16 halves model weight memory (~600 MB vs ~1.2 GB), usable on smaller GPUs.
+- **No overflow risk:** bfloat16 shares float32's exponent range — attention softmax cannot overflow, unlike float16.
+
+### Cons
+- **Ampere+ only:** Falls back to float32 with a warning on older GPUs; `_resolve_bf16()` checks `torch.cuda.is_bf16_supported()` at load time.
+- **Preprocessor boundary cost:** One explicit cast per batch at the encoder input; negligible in practice.
+
+---
+
+## 11. Idle session sweeper
 
 A background asyncio task polls every `session_sweep_interval_s` (default 30s) and evicts sessions silent longer than `idle_timeout_s` (default 60s). Complements uvicorn WS ping/pong (which handles dead TCP); the sweeper handles the "ghost session" case where TCP is alive but the client stopped sending audio.
 

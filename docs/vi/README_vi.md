@@ -15,6 +15,8 @@ Framework nhận dạng giọng nói theo thời gian thực (Speech-to-Text), h
 - **True GPU batching** — `dynamic` mode stack sessions vào một forward pass `[B, D, T]`; nhóm theo ngôn ngữ và decoder state
 - **Idle session cleanup** — sweeper evict ghost sessions (TCP alive, không có audio) sau `idle_timeout_s`; bổ sung WS ping/pong
 - **Bounded inference queue** — non-final chunks vượt `max_pending_per_session` bị drop; ngăn latency spiral
+- **Chế độ bfloat16** — tùy chọn `use_bf16` giảm một nửa VRAM model trên GPU Ampere+; preprocessor giữ float32, mel cast tại ranh giới encoder; fallback tự động nếu GPU không hỗ trợ
+- **Runtime metrics** — `GET /health/stats` trả về queue depth, drop count, inference count, rolling `avg_batch_size`, `avg_gpu_batch_size` (sau group-split), và `batch_latency_ms` (p50/p99)
 
 <br />
 
@@ -107,7 +109,8 @@ make test-client WAV=resources/sample_vi.wav
 
 ### 🔌 Transport & API
 - [x] WebSocket endpoint với typed JSON frames (`start` / `audio` / `end`)
-- [x] Health check HTTP endpoint
+- [x] Health check HTTP endpoint (`/health`)
+- [x] Runtime metrics endpoint (`/health/stats`) — queue depth, drop/inference counts, batch size và latency histograms
 - [x] Session capacity limit với WebSocket close code 1008
 
 ### 🤖 ASR & Inference
@@ -117,6 +120,7 @@ make test-client WAV=resources/sample_vi.wav
 - [x] Batch scheduler: `per_session` và `dynamic` mode
 - [x] True GPU batching trong `dynamic` mode (forward pass `[B, D, T]`)
 - [x] Model pool — loại bỏ race condition lang-prompt đa ngôn ngữ
+- [x] Chế độ bfloat16 — tùy chọn giảm VRAM trên Ampere+; fallback tự động
 - [ ] INT8 quantization để giảm VRAM per session
 
 ### 🎤 Audio Pipeline

@@ -15,6 +15,8 @@ A production-ready multi-user streaming Speech-to-Text framework built on FastAP
 - **True GPU batching** — `dynamic` mode stacks sessions into a single `[B, D, T]` forward pass; groups by language and decoder state for homogeneous batches
 - **Idle session cleanup** — background sweeper evicts ghost sessions (TCP alive, no audio) after `idle_timeout_s`; complements WS ping/pong for dead TCP
 - **Bounded inference queue** — non-final chunks beyond `max_pending_per_session` are dropped; prevents latency spiral under GPU load
+- **bfloat16 precision** — optional `use_bf16` mode halves model VRAM on Ampere+ GPUs; preprocessor stays float32, mel cast at encoder boundary; falls back gracefully if GPU does not support it
+- **Runtime metrics** — `GET /health/stats` returns queue depth, drop count, inference count, rolling `avg_batch_size`, `avg_gpu_batch_size` (post group-split), and `batch_latency_ms` (p50/p99)
 
 <br />
 
@@ -107,7 +109,8 @@ make test-client WAV=resources/sample_vi.wav
 
 ### 🔌 Transport & API
 - [x] WebSocket endpoint with typed JSON frames (`start` / `audio` / `end`)
-- [x] Health check HTTP endpoint
+- [x] Health check HTTP endpoint (`/health`)
+- [x] Runtime metrics endpoint (`/health/stats`) — queue depth, drop/inference counts, batch size and latency histograms
 - [x] Session capacity limit with WebSocket close code 1008
 
 ### 🤖 ASR & Inference
@@ -117,6 +120,7 @@ make test-client WAV=resources/sample_vi.wav
 - [x] Batch scheduler: `per_session` and `dynamic` mode
 - [x] True GPU batching in `dynamic` mode (`[B, D, T]` forward pass)
 - [x] Model pool — eliminates lang-prompt race condition for multi-language
+- [x] bfloat16 precision mode — optional VRAM reduction on Ampere+; graceful fallback
 - [ ] INT8 quantization to reduce VRAM per session
 
 ### 🎤 Audio Pipeline

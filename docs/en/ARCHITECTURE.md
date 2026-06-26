@@ -328,6 +328,8 @@ With `balanced` preset (560ms): user sees transcript ~575–620ms after the star
 | Model pool (not singleton) | Pool-based exclusive acquisition eliminates lang-prompt race condition for multi-lang | Single shared model + Lock: race window between set_inference_prompt and conformer_stream_step |
 | Bounded inference queue per session | Drops stale non-final chunks; prevents queue bloat under slow GPU | Unbounded queue: back-pressure causes latency spiral |
 | Idle session sweeper | Reclaims VRAM from ghost sessions (TCP alive, no audio); complements WS ping/pong | Rely on ping/pong only: doesn't handle soft "client went silent" case |
+| bfloat16 precision | Halves model VRAM on Ampere+; same exponent range as float32, no overflow risk; preprocessor kept float32 to avoid precision loss at filterbank stage | float16: overflow-prone in attention softmax; int8: quality risk without careful calibration |
+| Two-phase queue drain | `get_nowait()` drains already-queued items before async wait — reduces event-loop round-trips under burst load | Single `asyncio.wait_for` per item: works but adds unnecessary await overhead when queue is already populated |
 | JSON text frames + base64 | Browser-friendly, debuggable; 33% overhead acceptable | Binary WS frames: more efficient but more complex; add later if needed |
 | Per-session cache tensors | Model is cache-aware by design; att_cache cannot be shared | Stateless inference (re-encode from scratch each chunk): loses left context |
 | No VAD | Cache-aware model handles silence naturally (empty output); reduces complexity | Silero VAD: add later as GPU optimization |

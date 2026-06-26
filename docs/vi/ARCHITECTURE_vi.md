@@ -334,5 +334,7 @@ Với preset `balanced` (560ms): user thấy transcript sau ~575–620ms kể t�
 | Model pool (không phải singleton) | Pool-based exclusive acquisition loại bỏ race condition lang-prompt | Single model + Lock: vẫn có race window giữa set_inference_prompt và conformer_stream_step |
 | Bounded inference queue per session | Drop chunk lỗi thời, ngăn latency spiral khi GPU chậm | Unbounded queue: queue phình to, latency tăng dần |
 | Idle session sweeper | Thu hồi VRAM từ ghost sessions (TCP alive, không có audio); bổ sung WS ping/pong | Chỉ dùng ping/pong: không xử lý được soft "client im lặng" |
+| Chế độ bfloat16 | Giảm một nửa VRAM model trên Ampere+; cùng dải exponent với float32, không có overflow risk; preprocessor giữ float32 để tránh mất độ chính xác tại filterbank | float16: dễ overflow trong attention softmax; int8: rủi ro chất lượng khi thiếu calibration |
+| Two-phase queue drain | `get_nowait()` drain hết items sẵn có trước khi async wait — giảm event-loop round-trip khi có burst request | Một `asyncio.wait_for` per item: hoạt động nhưng tạo overhead không cần thiết khi queue đã có sẵn nhiều items |
 
 ---

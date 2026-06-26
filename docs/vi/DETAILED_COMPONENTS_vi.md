@@ -7,6 +7,7 @@ Entry point của ứng dụng. Khởi tạo FastAPI app, kết nối lifespan, 
 - `lifespan(app)` — gọi `startup()` trước khi nhận request, `shutdown()` khi dừng server
 - Đăng ký `ws_router` chứa endpoint `/ws/stream`
 - `/health` — trả về `model_ready`, `active_sessions`, `preset`, `batch_mode`
+- `/health/stats` — trả về runtime metrics: `active_sessions`, `max_sessions`, `queue_depth`, `drop_count`, `inference_count`, `avg_batch_size`, `avg_gpu_batch_size`, `batch_latency_ms`, `bf16_enabled`
 
 ## WebSocket Router (`app/routers/websocket.py`)
 
@@ -135,12 +136,15 @@ Wrapper quanh `nvidia/nemotron-3.5-asr-streaming-0.6b`. Duy trì pool gồm `mod
 3. `set_default_att_context_size()` — áp dụng look-ahead frames từ preset
 4. `change_decoding_strategy()` nếu khác `greedy_batch`
 5. `set_inference_prompt()` — set ngôn ngữ mặc định (**bắt buộc** — thiếu thì model trả chuỗi rỗng)
+6. Nếu `use_bf16=true` và GPU hỗ trợ bfloat16: cast toàn bộ model sang `bfloat16`, sau đó restore preprocessor về `float32`. Mel features được cast sang bfloat16 qua `_to_encoder_dtype()` ngay trước encoder forward pass.
 
 > `model_pool_size > 1` yêu cầu per-instance CUDA stream isolation; giữ ở 1 cho đến khi triển khai xong.
 
+`_preprocess_batch(requests, model)` — batch preprocessing hoàn toàn trong torch: decode từng PCM chunk thành `torch.Tensor` float32, resample in-place nếu cần (không có numpy roundtrip sau resample), pad tất cả tensors về `T_max` bằng `torch.zeros`, rồi chạy một lần `model.preprocessor()` cho cả batch. Trả về `(mel_batch, mel_len_batch)` đã cast sang encoder dtype qua `_to_encoder_dtype()`.
+
 `stream_step(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)`: acquire instance → preprocess → set lang → `conformer_stream_step` → trả instance trong `finally`.
 
-`stream_step_batch(requests)` — true GPU batching: nhóm requests theo `(lang, has_decoder_state)` để đảm bảo homogeneous cache shapes, gọi `_batch_infer()` mỗi nhóm. Stack mels `[B, D, T_max]` và caches theo batch dim; một `conformer_stream_step(B>1)` call per nhóm.
+`stream_step_batch(requests)` — true GPU batching: nhóm requests theo `(lang, has_decoder_state)` để đảm bảo homogeneous cache shapes, gọi `_batch_infer()` mỗi nhóm. Stack mels `[B, D, T_max]` và caches theo batch dim; một `conformer_stream_step(B>1)` call per nhóm. Ghi lại kích thước batch GPU thực tế qua `stats.record_gpu_batch(B)` trước mỗi forward pass.
 
 ## BatchScheduler (`app/asr/scheduler.py`)
 
@@ -148,10 +152,19 @@ Wrapper quanh `nvidia/nemotron-3.5-asr-streaming-0.6b`. Duy trì pool gồm `mod
 
 `per_session` — mỗi request được dispatch ngay qua `loop.run_in_executor(thread_pool, engine.stream_step, ...)`.
 
-`dynamic` — requests được đưa vào `asyncio.Queue`; background worker gom tối đa `max_batch_size` requests trong `batch_timeout_ms` rồi gọi `engine.stream_step_batch()` một lần.
+`dynamic` — requests được đưa vào `asyncio.Queue`; background worker gom tối đa `max_batch_size` requests trong `batch_timeout_ms` rồi gọi `engine.stream_step_batch()` một lần. Worker dùng two-phase drain: ngay sau khi nhận item đầu tiên, drain hết các item đã có sẵn trong queue bằng `get_nowait()` trước khi bước vào async wait — giảm event-loop overhead khi có burst request.
 
 - `submit(pcm_bytes, sample_rate, cache, lang)` → `(text, new_cache)` — interface chung cho cả hai mode; caller chỉ cần `await` mà không cần biết mode
 - `start()` / `stop()` — lifecycle; `stop()` hủy worker task và shutdown thread pool
+
+## Metrics (`app/services/metrics.py`)
+
+Singleton `stats` cấp module. Thread-safe với GIL cho counter increment; mọi read đều qua `snapshot()`.
+
+- `record_drop()` — tăng `drop_count`
+- `record_batch(batch_size, latency_ms)` — tăng `inference_count`; thêm vào deque rolling 200 mẫu `(scheduler_batch_size, latency_ms)`
+- `record_gpu_batch(batch_size)` — ghi lại `B` thực tế của một lần `conformer_stream_step` vào deque rolling 500 mẫu; khác với scheduler-level batch size vì `stream_step_batch` chia requests thành các nhóm đồng nhất (theo ngôn ngữ/decoder state) trước
+- `snapshot()` — trả về `avg_batch_size` (scheduler-level), `avg_gpu_batch_size` (GPU-level, sau group-split), và `batch_latency_ms` với `p50`/`p99` trên rolling window
 
 ## Schema (`app/schema/`)
 
