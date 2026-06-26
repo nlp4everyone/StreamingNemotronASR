@@ -209,13 +209,17 @@ class BatchScheduler:
 
             # 3. resolve each caller's future with its result
             for req, result in zip(batch, results):
-                if not req.future.done():
+                try:
                     req.future.set_result(result)
+                except asyncio.InvalidStateError:
+                    pass
         except Exception as exc:
             logger.exception("batch inference failed (size=%d)", len(batch))
             # propagate the exception to all waiting callers
             for req in batch:
-                if not req.future.done():
+                try:
                     req.future.set_exception(exc)
+                except asyncio.InvalidStateError:
+                    pass
 
 

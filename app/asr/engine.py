@@ -140,6 +140,41 @@ class NemoStreamingEngine:
             mel, mel_len = model.preprocessor(input_signal=audio_t, length=audio_len)
         return mel, mel_len
 
+    def _preprocess_batch(
+        self,
+        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
+        model,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert all PCM chunks to log-mel in one batched GPU call.
+
+        Returns:
+            (mel_batch [B, D, T], mel_len_batch [B]) cast to encoder dtype.
+        """
+        audios = []
+        for pcm_bytes, sample_rate, _, _ in requests:
+            audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if sample_rate != 16000:
+                waveform = torch.from_numpy(audio).unsqueeze(0)
+                waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+                audio = waveform.squeeze(0).numpy()
+            audios.append(audio)
+
+        lengths = [len(a) for a in audios]
+        T_max = max(lengths)
+        audio_batch = np.zeros((len(audios), T_max), dtype=np.float32)
+        for i, a in enumerate(audios):
+            audio_batch[i, : len(a)] = a
+
+        audio_t = torch.from_numpy(audio_batch).to(self._device)
+        audio_len = torch.tensor(lengths, dtype=torch.long, device=self._device)
+
+        with torch.inference_mode():
+            mel_batch, mel_len_batch = model.preprocessor(
+                input_signal=audio_t, length=audio_len
+            )
+
+        return self._to_encoder_dtype(mel_batch), mel_len_batch
+
     # ── Single-session inference ───────────────────────────────────────────────
 
     def stream_step(
@@ -168,12 +203,15 @@ class NemoStreamingEngine:
 
         model = self._pool.get()
         try:
+            # 1. preprocess → [1, D, T]
             mel, mel_len = self._preprocess(pcm_bytes, sample_rate, model)
             mel = self._to_encoder_dtype(mel)
 
+            # 2. set language — safe: this instance is not shared with any other thread
             if hasattr(model, "set_inference_prompt"):
                 model.set_inference_prompt(lang)
 
+            # 3. single GPU forward pass
             with torch.inference_mode():
                 (
                     greedy_predictions,
@@ -266,24 +304,14 @@ class NemoStreamingEngine:
         B = len(requests)
         model = self._pool.get()
         try:
-            # 1. preprocess per session (float32), then cast to encoder dtype
-            mels_lens = [self._preprocess(pcm, sr, model) for pcm, sr, _, _ in requests]
-            mels = [self._to_encoder_dtype(ml[0]) for ml in mels_lens]
-            mel_lens = [ml[1] for ml in mels_lens]
+            # 1. batch preprocess → [B, D, T_max], [B]
+            mel_batch, mel_len_batch = self._preprocess_batch(requests, model)
 
-            # 2. pad to T_max and stack → [B, D, T_max]
-            D = mels[0].shape[1]
-            T_max = max(m.shape[2] for m in mels)
-            mel_batch = mels[0].new_zeros(B, D, T_max)
-            for i, m in enumerate(mels):
-                mel_batch[i, :, : m.shape[2]] = m[0]
-            mel_len_batch = torch.cat(mel_lens, dim=0)
-
-            # 3. stack encoder caches along batch dim
+            # 2. stack encoder caches along batch dim
             caches = [r[2] for r in requests]
             att_batch, conv_batch, att_len_batch = self._stack_encoder_caches(caches)
 
-            # 4. decoder state
+            # 3. decoder state
             all_hyps = [c.hypotheses for c in caches]
             previous_hypotheses = (
                 None if all(h is None for h in all_hyps) else [h[0] for h in all_hyps]
@@ -293,12 +321,12 @@ class NemoStreamingEngine:
                 None if all(p is None for p in all_preds) else [p[0] for p in all_preds]
             )
 
-            # 5. set language — safe: this instance is not shared with any other thread
+            # 4. set language — safe: this instance is not shared with any other thread
             lang = requests[0][3]
             if hasattr(model, "set_inference_prompt"):
                 model.set_inference_prompt(lang)
 
-            # 6. single GPU forward pass for the whole batch
+            # 5. single GPU forward pass for the whole batch
             with torch.inference_mode():
                 (
                     greedy_predictions,

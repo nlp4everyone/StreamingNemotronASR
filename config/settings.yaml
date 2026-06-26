@@ -16,7 +16,7 @@ streaming_preset: balanced
 #              GPU utilisation is below 50%.
 batch_mode: dynamic
 max_batch_size: 32
-batch_timeout_ms: 30
+batch_timeout_ms: 80
 
 # ── Server ────────────────────────────────────────────────────────────────────
 host: "0.0.0.0"
@@ -55,6 +55,8 @@ max_pending_per_session: 2
 # Dead TCP connections are handled by uvicorn ws-ping-interval=20 ws-ping-timeout=30.
 idle_timeout_s: 60.0
 session_sweep_interval_s: 30.0
-# With pool_size=1 only one _batch_infer runs at a time; 2 workers allows the
-# second thread to preprocess (CPU) while the first holds the pool lock.
+# With pool_size=1, only one thread runs at a time — the second blocks at
+# pool.get() but wakes immediately when the first finishes, eliminating
+# asyncio scheduling overhead between consecutive batches.
+# Increase alongside model_pool_size if per-instance CUDA streams are added.
 thread_pool_workers: 2
