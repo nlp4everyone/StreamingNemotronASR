@@ -166,8 +166,17 @@ class BatchScheduler:
         # 1. block until at least one request is available
         batch = [await self._queue.get()]
 
-        # 2. drain the queue until deadline or max_batch_size is reached
+        # 2. deadline anchored to first item — same window regardless of drain speed
         deadline = self._loop.time() + settings.batch_timeout_ms / 1000.0
+
+        # 3. drain any already-queued requests immediately (no event-loop overhead)
+        while len(batch) < settings.max_batch_size:
+            try:
+                batch.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        # 4. wait for stragglers within the remaining window
         while len(batch) < settings.max_batch_size:
             remaining = deadline - self._loop.time()
             if remaining <= 0:

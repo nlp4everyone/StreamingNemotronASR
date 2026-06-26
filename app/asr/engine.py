@@ -5,11 +5,8 @@ from collections import defaultdict
 import numpy as np
 import torch
 import torchaudio
-
 from config import settings
-
 logger = logging.getLogger(__name__)
-
 
 class NemoStreamingEngine:
     """
@@ -70,13 +67,17 @@ class NemoStreamingEngine:
         t1 = time.perf_counter()
         logger.info("loading instance %d/%d ...", idx + 1, total)
 
+        # 1. download/load weights onto target device
         model = nemo_asr.models.ASRModel.from_pretrained(
             model_name=settings.model_name,
             map_location=self._device,
         )
         model.eval()
+
+        # 2. configure streaming context window
         model.encoder.set_default_att_context_size(list(settings.preset.att_context_size))
 
+        # 3. apply decoding overrides
         if settings.decoding_strategy != "greedy_batch":
             model.change_decoding_strategy(
                 decoding_cfg={"strategy": settings.decoding_strategy}
@@ -84,6 +85,7 @@ class NemoStreamingEngine:
         if settings.max_symbols_per_step != 10:
             model.decoding.cfg.greedy.max_symbols = settings.max_symbols_per_step
 
+        # 4. set default language prompt
         if hasattr(model, "set_inference_prompt"):
             model.set_inference_prompt(settings.default_lang)
 
@@ -107,15 +109,17 @@ class NemoStreamingEngine:
     def bf16_enabled(self) -> bool:
         return self._use_bf16
 
-    def _to_encoder_dtype(self, mel: torch.Tensor) -> torch.Tensor:
+    def _to_encoder_dtype(self,
+                          mel: torch.Tensor) -> torch.Tensor:
         """Cast mel features to match encoder weight dtype when bf16 is enabled."""
         return mel.bfloat16() if self._use_bf16 else mel
 
     # ── Preprocessing ──────────────────────────────────────────────────────────
 
-    def _preprocess(
-        self, pcm_bytes: bytes, sample_rate: int, model
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _preprocess(self,
+                    pcm_bytes: bytes,
+                    sample_rate: int,
+                    model) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert raw PCM audio to log-mel spectrogram features.
 
         Args:
@@ -126,13 +130,16 @@ class NemoStreamingEngine:
         Returns:
             Tuple of (mel, mel_len) where mel has shape [1, D, T] and mel_len has shape [1].
         """
+        # 1. decode int16 PCM → normalized float32
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
+        # 2. resample to 16 kHz if needed
         if sample_rate != 16000:
             waveform = torch.from_numpy(audio).unsqueeze(0)
             waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
             audio = waveform.squeeze(0).numpy()
 
+        # 3. move to device and extract log-mel
         audio_t = torch.from_numpy(audio).unsqueeze(0).to(self._device)
         audio_len = torch.tensor([len(audio)], dtype=torch.long, device=self._device)
 
@@ -140,32 +147,34 @@ class NemoStreamingEngine:
             mel, mel_len = model.preprocessor(input_signal=audio_t, length=audio_len)
         return mel, mel_len
 
-    def _preprocess_batch(
-        self,
-        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
-        model,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _preprocess_batch(self,
+                          requests: list[tuple[bytes, int, "ASRCacheState", str]],
+                          model) -> tuple[torch.Tensor, torch.Tensor]:
         """Convert all PCM chunks to log-mel in one batched GPU call.
 
         Returns:
             (mel_batch [B, D, T], mel_len_batch [B]) cast to encoder dtype.
         """
-        audios = []
+        # 1. decode each chunk; stay in torch to avoid numpy roundtrip after resample
+        tensors: list[torch.Tensor] = []
         for pcm_bytes, sample_rate, _, _ in requests:
             audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            waveform = torch.from_numpy(audio)
             if sample_rate != 16000:
-                waveform = torch.from_numpy(audio).unsqueeze(0)
-                waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-                audio = waveform.squeeze(0).numpy()
-            audios.append(audio)
+                waveform = torchaudio.functional.resample(
+                    waveform.unsqueeze(0), sample_rate, 16000
+                ).squeeze(0)
+            tensors.append(waveform)
 
-        lengths = [len(a) for a in audios]
+        # 2. pad to T_max and stack → [B, T_max]
+        lengths = [t.shape[0] for t in tensors]
         T_max = max(lengths)
-        audio_batch = np.zeros((len(audios), T_max), dtype=np.float32)
-        for i, a in enumerate(audios):
-            audio_batch[i, : len(a)] = a
+        audio_batch = torch.zeros(len(tensors), T_max, dtype=torch.float32)
+        for i, t in enumerate(tensors):
+            audio_batch[i, : lengths[i]] = t
 
-        audio_t = torch.from_numpy(audio_batch).to(self._device)
+        # 3. move batch to device and extract log-mel
+        audio_t = audio_batch.to(self._device)
         audio_len = torch.tensor(lengths, dtype=torch.long, device=self._device)
 
         with torch.inference_mode():
@@ -177,13 +186,11 @@ class NemoStreamingEngine:
 
     # ── Single-session inference ───────────────────────────────────────────────
 
-    def stream_step(
-        self,
-        pcm_bytes: bytes,
-        sample_rate: int,
-        cache: "ASRCacheState",  # noqa: F821
-        lang: str = "auto",
-    ) -> tuple[str, "ASRCacheState"]:  # noqa: F821
+    def stream_step(self,
+                    pcm_bytes: bytes,
+                    sample_rate: int,
+                    cache: "ASRCacheState",
+                    lang: str = "auto") -> tuple[str, "ASRCacheState"]:  # noqa: F821
         """Run one streaming inference step for a single session.
 
         Acquires an exclusive model instance from the pool — set_inference_prompt
@@ -203,7 +210,7 @@ class NemoStreamingEngine:
 
         model = self._pool.get()
         try:
-            # 1. preprocess → [1, D, T]
+            # 1. preprocess → [1, D, T], cast dtype
             mel, mel_len = self._preprocess(pcm_bytes, sample_rate, model)
             mel = self._to_encoder_dtype(mel)
 
@@ -249,10 +256,8 @@ class NemoStreamingEngine:
 
     # ── Batch inference ────────────────────────────────────────────────────────
 
-    def stream_step_batch(
-        self,
-        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
-    ) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
+    def stream_step_batch(self,
+                          requests: list[tuple[bytes, int, "ASRCacheState", str]]) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
         """Run inference for multiple sessions in one GPU call.
 
         Groups requests by (lang, has_decoder_state) so each sub-batch has
@@ -269,6 +274,7 @@ class NemoStreamingEngine:
             pcm, sr, cache, lang = requests[0]
             return [self.stream_step(pcm, sr, cache, lang)]
 
+        # group by (lang, has_decoder_state) — each sub-batch must be homogeneous
         groups: dict[tuple, list[tuple[int, tuple]]] = defaultdict(list)
         for i, req in enumerate(requests):
             _, _, cache, lang = req
@@ -284,10 +290,8 @@ class NemoStreamingEngine:
 
         return results
 
-    def _batch_infer(
-        self,
-        requests: list[tuple[bytes, int, "ASRCacheState", str]],  # noqa: F821
-    ) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
+    def _batch_infer(self,
+                     requests: list[tuple[bytes, int, "ASRCacheState", str]]) -> list[tuple[str, "ASRCacheState"]]:  # noqa: F821
         """True GPU batch inference for a homogeneous group of requests.
 
         Acquires an exclusive model instance — set_inference_prompt and
@@ -299,19 +303,21 @@ class NemoStreamingEngine:
         Returns:
             List of (transcript_text, updated_cache) in the same order.
         """
+        from app.services.metrics import stats
         from app.session.state import ASRCacheState
 
         B = len(requests)
+        stats.record_gpu_batch(B)
         model = self._pool.get()
         try:
             # 1. batch preprocess → [B, D, T_max], [B]
             mel_batch, mel_len_batch = self._preprocess_batch(requests, model)
 
-            # 2. stack encoder caches along batch dim
+            # 2. stack encoder caches → [layers, B, D, T]
             caches = [r[2] for r in requests]
             att_batch, conv_batch, att_len_batch = self._stack_encoder_caches(caches)
 
-            # 3. decoder state
+            # 3. decoder state — None if all sessions are on first chunk
             all_hyps = [c.hypotheses for c in caches]
             previous_hypotheses = (
                 None if all(h is None for h in all_hyps) else [h[0] for h in all_hyps]
@@ -352,6 +358,7 @@ class NemoStreamingEngine:
 
         logger.debug("batch inference B=%d lang=%s", B, lang)
 
+        # 6. split batch outputs back into per-session (text, cache) tuples
         results = []
         for i in range(B):
             item = all_hyp_or_texts[i] if all_hyp_or_texts else None
@@ -367,10 +374,8 @@ class NemoStreamingEngine:
             ))
         return results
 
-    def _stack_encoder_caches(
-        self,
-        caches: list["ASRCacheState"],  # noqa: F821
-    ) -> tuple["torch.Tensor | None", "torch.Tensor | None", "torch.Tensor | None"]:
+    def _stack_encoder_caches(self,
+                              caches: list["ASRCacheState"]) -> tuple["torch.Tensor | None", "torch.Tensor | None", "torch.Tensor | None"]:
         """Concatenate per-session encoder caches along the batch dimension (dim=1).
 
         Returns (None, None, None) when all caches are None so NeMo initialises
@@ -383,6 +388,7 @@ class NemoStreamingEngine:
         Returns:
             Tuple of (att_cache, conv_cache, att_cache_len), each None or batched.
         """
+        # 1. all-None → let NeMo init its own zero caches
         att_caches = [c.att_cache for c in caches]
         if all(a is None for a in att_caches):
             return None, None, None
@@ -390,10 +396,12 @@ class NemoStreamingEngine:
         conv_caches = [c.conv_cache for c in caches]
         att_lens = [c.att_cache_len for c in caches]
 
+        # 2. find reference shapes for zero-filling new sessions
         ref_att = next(a for a in att_caches if a is not None)
         ref_conv = next(c for c in conv_caches if c is not None)
         ref_len = next(l for l in att_lens if l is not None)
 
+        # 3. fill None slots with zeros, then cat along batch dim (dim=1)
         att_list = [a if a is not None else torch.zeros_like(ref_att) for a in att_caches]
         conv_list = [c if c is not None else torch.zeros_like(ref_conv) for c in conv_caches]
         len_list = [l if l is not None else torch.zeros_like(ref_len) for l in att_lens]
