@@ -353,25 +353,30 @@ class NemoStreamingEngine:
                     drop_extra_pre_encoded=None,
                     return_transcription=True,
                 )
+
+            # 6. split batch outputs back into per-session (text, cache) tuples
+            # Kept inside the pool critical section so pool.put() only happens after
+            # all copy_() ops are submitted — prevents Thread B from grabbing the model
+            # mid-group (between en and vi sub-batches in stream_step_batch) which would
+            # delay the second group's inference and desynchronize sessions.
+            logger.debug("batch inference B=%d lang=%s", B, lang)
+            results = []
+            for i in range(B):
+                item = all_hyp_or_texts[i] if all_hyp_or_texts else None
+                src = caches[i]
+                results.append((
+                    _extract_text(item),
+                    ASRCacheState(
+                        att_cache=_slice_inplace(src.att_cache, new_att_batch, i) if new_att_batch is not None else None,
+                        conv_cache=_slice_inplace(src.conv_cache, new_conv_batch, i) if new_conv_batch is not None else None,
+                        att_cache_len=_slice_inplace(src.att_cache_len, new_att_len_batch, i) if new_att_len_batch is not None else None,
+                        hypotheses=[best_hyp_batch[i]] if best_hyp_batch is not None else None,
+                        pred_out=[greedy_predictions[i]],
+                    ),
+                ))
         finally:
             self._pool.put(model)
 
-        logger.debug("batch inference B=%d lang=%s", B, lang)
-
-        # 6. split batch outputs back into per-session (text, cache) tuples
-        results = []
-        for i in range(B):
-            item = all_hyp_or_texts[i] if all_hyp_or_texts else None
-            results.append((
-                _extract_text(item),
-                ASRCacheState(
-                    att_cache=new_att_batch[:, i : i + 1, ...] if new_att_batch is not None else None,
-                    conv_cache=new_conv_batch[:, i : i + 1, ...] if new_conv_batch is not None else None,
-                    att_cache_len=new_att_len_batch[:, i : i + 1] if new_att_len_batch is not None else None,
-                    hypotheses=[best_hyp_batch[i]] if best_hyp_batch is not None else None,
-                    pred_out=[greedy_predictions[i]],
-                ),
-            ))
         return results
 
     def _stack_encoder_caches(self,
@@ -411,6 +416,27 @@ class NemoStreamingEngine:
             torch.cat(conv_list, dim=1),
             torch.cat(len_list, dim=1),
         )
+
+
+def _slice_inplace(
+    existing: "torch.Tensor | None",
+    batch: torch.Tensor,
+    idx: int,
+) -> torch.Tensor:
+    """Extract session idx's slice from a batch output tensor.
+
+    - Established session (existing tensor, shape matches): copy_ in-place.
+      No new GPU allocation; batch tensor reference not retained.
+    - First chunk (existing is None): clone() to allocate a fresh tensor.
+      The clone breaks the view reference so batch can be freed immediately.
+
+    dim=1 is the batch dimension for att_cache [layers, B, ...],
+    conv_cache [layers, B, ...], and att_cache_len [layers, B].
+    """
+    src = batch.narrow(1, idx, 1)          # view — zero copy, no refcount bump on batch data
+    if existing is not None and existing.shape == src.shape:
+        return existing.copy_(src)         # in-place: reuse buffer, no allocation
+    return src.clone()                     # first chunk: allocate once, break batch ref
 
 
 def _extract_text(item) -> str:
