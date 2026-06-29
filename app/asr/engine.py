@@ -23,6 +23,12 @@ class NemoStreamingEngine:
         self._device = settings.device
         self._loaded = False
         self._use_bf16: bool = False
+        # Zero-fill tensors for new sessions joining a batch that already has
+        # established sessions. Allocated once on first mixed batch, reused forever
+        # — avoids a GPU malloc per new session (burst-connect CUDA alloc storm).
+        self._zero_att: torch.Tensor | None = None
+        self._zero_conv: torch.Tensor | None = None
+        self._zero_len: torch.Tensor | None = None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -157,29 +163,44 @@ class NemoStreamingEngine:
         Returns:
             (mel_batch [B, D, T], mel_len_batch [B]) cast to encoder dtype.
         """
-        # 1. decode each chunk; stay in torch to avoid numpy roundtrip after resample
-        tensors: list[torch.Tensor] = []
-        for pcm_bytes, sample_rate, _, _ in requests:
-            audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            waveform = torch.from_numpy(audio)
-            if sample_rate != 16000:
-                waveform = torchaudio.functional.resample(
-                    waveform.unsqueeze(0), sample_rate, 16000
-                ).squeeze(0)
-            tensors.append(waveform)
-
-        # 2. pad to T_max and stack → [B, T_max]
-        # Clamp T_max to the preset chunk size so one outlier or EOS-flush chunk
-        # cannot inflate the full batch tensor. chunk_frames * 1280 = chunk_frames
-        # × 80 ms × 16 samples/ms — the maximum samples one inference call should carry.
-        lengths = [t.shape[0] for t in tensors]
+        B = len(requests)
         max_chunk_samples = settings.preset.chunk_frames * 1280
-        T_max = min(max(lengths), max_chunk_samples)
-        audio_batch = torch.zeros(len(tensors), T_max, dtype=torch.float32)
-        for i, t in enumerate(tensors):
-            n = min(t.shape[0], T_max)
-            audio_batch[i, :n] = t[:n]
-        clamped_lengths = [min(l, T_max) for l in lengths]
+
+        if all(sr == 16000 for _, sr, _, _ in requests):
+            # Fast path: all 16 kHz — one numpy stack, one torch conversion, no padding.
+            # Buffer guarantees every chunk is exactly target_bytes long, so all arrays
+            # share the same shape and np.stack never needs to pad.
+            arrays = [np.frombuffer(pb, dtype=np.int16) for pb, _, _, _ in requests]
+            audio_np = np.stack(arrays).astype(np.float32)  # [B, T], one alloc
+            audio_np /= 32768.0                             # in-place, no extra alloc
+            T = min(audio_np.shape[1], max_chunk_samples)
+            src = audio_np if T == audio_np.shape[1] else np.ascontiguousarray(audio_np[:, :T])
+            audio_batch = torch.from_numpy(src)             # zero-copy share
+            clamped_lengths = [T] * B
+        else:
+            # Slow path: mixed sample rates — decode per chunk with resampling, then
+            # preallocate with torch.empty (no upfront zero-fill) and fill in-place;
+            # only the tail-padding region is explicitly zeroed.
+            waveforms: list[torch.Tensor] = []
+            for pcm_bytes, sample_rate, _, _ in requests:
+                waveform = torch.from_numpy(
+                    np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+                ) / 32768.0
+                if sample_rate != 16000:
+                    waveform = torchaudio.functional.resample(
+                        waveform.unsqueeze(0), sample_rate, 16000
+                    ).squeeze(0)
+                waveforms.append(waveform)
+
+            T_max = min(max(w.shape[0] for w in waveforms), max_chunk_samples)
+            audio_batch = torch.empty(B, T_max, dtype=torch.float32)
+            clamped_lengths = []
+            for i, w in enumerate(waveforms):
+                n = min(w.shape[0], T_max)
+                audio_batch[i, :n] = w[:n]
+                if n < T_max:
+                    audio_batch[i, n:].zero_()
+                clamped_lengths.append(n)
 
         # 3. move batch to device and extract log-mel
         audio_t = audio_batch.to(self._device)
@@ -414,10 +435,18 @@ class NemoStreamingEngine:
         ref_conv = next(c for c in conv_caches if c is not None)
         ref_len = next(l for l in att_lens if l is not None)
 
-        # 3. fill None slots with zeros, then cat along batch dim (dim=1)
-        att_list = [a if a is not None else torch.zeros_like(ref_att) for a in att_caches]
-        conv_list = [c if c is not None else torch.zeros_like(ref_conv) for c in conv_caches]
-        len_list = [l if l is not None else torch.zeros_like(ref_len) for l in att_lens]
+        # 3. lazy-init zero-fill tensors once; reuse on every subsequent call.
+        # torch.cat only reads its inputs, so sharing the same zero tensor across
+        # multiple None slots in the same call is safe.
+        if self._zero_att is None:
+            self._zero_att = torch.zeros_like(ref_att)
+            self._zero_conv = torch.zeros_like(ref_conv)
+            self._zero_len = torch.zeros_like(ref_len)
+
+        # 4. fill None slots with zeros, then cat along batch dim (dim=1)
+        att_list = [a if a is not None else self._zero_att for a in att_caches]
+        conv_list = [c if c is not None else self._zero_conv for c in conv_caches]
+        len_list = [l if l is not None else self._zero_len for l in att_lens]
 
         return (
             torch.cat(att_list, dim=1),
