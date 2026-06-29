@@ -130,18 +130,20 @@ class NemoStreamingEngine:
         Returns:
             Tuple of (mel, mel_len) where mel has shape [1, D, T] and mel_len has shape [1].
         """
-        # 1. decode int16 PCM → normalized float32
-        audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        # 1. decode int16 PCM → normalized float32, convert to torch once
+        waveform = torch.from_numpy(
+            np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+        ) / 32768.0
 
-        # 2. resample to 16 kHz if needed
+        # 2. resample to 16 kHz if needed — stays in torch, no roundtrip back to numpy
         if sample_rate != 16000:
-            waveform = torch.from_numpy(audio).unsqueeze(0)
-            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
-            audio = waveform.squeeze(0).numpy()
+            waveform = torchaudio.functional.resample(
+                waveform.unsqueeze(0), sample_rate, 16000
+            ).squeeze(0)
 
         # 3. move to device and extract log-mel
-        audio_t = torch.from_numpy(audio).unsqueeze(0).to(self._device)
-        audio_len = torch.tensor([len(audio)], dtype=torch.long, device=self._device)
+        audio_t = waveform.unsqueeze(0).to(self._device)
+        audio_len = torch.tensor([waveform.shape[0]], dtype=torch.long, device=self._device)
 
         with torch.inference_mode():
             mel, mel_len = model.preprocessor(input_signal=audio_t, length=audio_len)
@@ -167,15 +169,21 @@ class NemoStreamingEngine:
             tensors.append(waveform)
 
         # 2. pad to T_max and stack → [B, T_max]
+        # Clamp T_max to the preset chunk size so one outlier or EOS-flush chunk
+        # cannot inflate the full batch tensor. chunk_frames * 1280 = chunk_frames
+        # × 80 ms × 16 samples/ms — the maximum samples one inference call should carry.
         lengths = [t.shape[0] for t in tensors]
-        T_max = max(lengths)
+        max_chunk_samples = settings.preset.chunk_frames * 1280
+        T_max = min(max(lengths), max_chunk_samples)
         audio_batch = torch.zeros(len(tensors), T_max, dtype=torch.float32)
         for i, t in enumerate(tensors):
-            audio_batch[i, : lengths[i]] = t
+            n = min(t.shape[0], T_max)
+            audio_batch[i, :n] = t[:n]
+        clamped_lengths = [min(l, T_max) for l in lengths]
 
         # 3. move batch to device and extract log-mel
         audio_t = audio_batch.to(self._device)
-        audio_len = torch.tensor(lengths, dtype=torch.long, device=self._device)
+        audio_len = torch.tensor(clamped_lengths, dtype=torch.long, device=self._device)
 
         with torch.inference_mode():
             mel_batch, mel_len_batch = model.preprocessor(
