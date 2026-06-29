@@ -191,44 +191,58 @@ class BatchScheduler:
 
     async def _dispatch_batch(self,
                               batch: list[_Request]) -> None:
-        """Run batch inference in the thread pool and resolve each request's future.
+        """Split batch by (lang, has_decoder_state) and run each group in parallel.
 
-        Args:
-            batch: List of pending _Request objects to process together.
-
-        Raises:
-            Exception: Any engine error is caught, logged, and forwarded to
-                each request's future so callers receive the exception.
+        Each group acquires an independent model instance from the pool, so groups
+        with different languages or decoder states run concurrently instead of
+        sequentially. Exceptions in one group are forwarded only to that group's
+        futures; other groups are unaffected.
         """
         import time
+        from collections import defaultdict
         from app.services.metrics import stats
 
+        t0 = time.perf_counter()
+
+        # Requests with different lang or decoder-state shape can't share a forward pass.
+        groups: dict[tuple, list[tuple[int, _Request]]] = defaultdict(list)
+        for i, req in enumerate(batch):
+            has_dec = req.cache.hypotheses is not None or req.cache.pred_out is not None
+            groups[(req.lang, has_dec)].append((i, req))
+
+        # Indices carry original batch positions so futures resolve correctly after gather.
+        outcomes = await asyncio.gather(
+            *[self._run_group(g) for g in groups.values()]
+        )
+        stats.record_batch(len(batch), (time.perf_counter() - t0) * 1000)
+
+        for i, res in (p for grp in outcomes for p in grp):
+            try:
+                if isinstance(res, Exception):
+                    batch[i].future.set_exception(res)
+                else:
+                    batch[i].future.set_result(res)
+            except asyncio.InvalidStateError:
+                pass
+
+    async def _run_group(self,
+                         indexed: list[tuple[int, _Request]]) -> list[tuple[int, object]]:
+        """Infer one homogeneous sub-batch; return (original_index, result_or_exc) pairs."""
+        indices = [i for i, _ in indexed]
+        engine_reqs = [(r.pcm_bytes, r.sample_rate, r.cache, r.lang) for _, r in indexed]
         try:
-            # 1. unpack requests into engine-friendly tuples
-            requests = [(r.pcm_bytes, r.sample_rate, r.cache, r.lang) for r in batch]
-
-            # 2. run blocking inference in the thread pool
-            t0 = time.perf_counter()
-            results = await self._loop.run_in_executor(
+            group_results = await self._loop.run_in_executor(
                 self._thread_pool,
-                self._engine.stream_step_batch,
-                requests,
+                self._engine._batch_infer,
+                engine_reqs,
             )
-            stats.record_batch(len(batch), (time.perf_counter() - t0) * 1000)
-
-            # 3. resolve each caller's future with its result
-            for req, result in zip(batch, results):
-                try:
-                    req.future.set_result(result)
-                except asyncio.InvalidStateError:
-                    pass
+            return list(zip(indices, group_results))
         except Exception as exc:
-            logger.exception("batch inference failed (size=%d)", len(batch))
-            # propagate the exception to all waiting callers
-            for req in batch:
-                try:
-                    req.future.set_exception(exc)
-                except asyncio.InvalidStateError:
-                    pass
+            logger.exception(
+                "group inference failed (size=%d lang=%s)",
+                len(engine_reqs),
+                indexed[0][1].lang,
+            )
+            return [(i, exc) for i in indices]
 
 
